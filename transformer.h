@@ -167,6 +167,8 @@ typedef struct {
 typedef struct {
     EncoderCache encoder_cache;
     DecoderCache decoder_cache;
+    Tensor3D src_input;
+    Tensor3D tgt_input;
     Tensor3D src_proj;
     Tensor3D tgt_proj;
     Tensor3D decoder_out;
@@ -214,7 +216,7 @@ Tensor3D feed_forward_forward(FeedForward *ffn, Tensor3D *x, Tensor3D *hidden_ca
 
 PositionalEncoding *positional_encoding_create(int d_model, int max_len, float dropout);
 void positional_encoding_free(PositionalEncoding *pe);
-Tensor3D positional_encoding_forward(PositionalEncoding *pe, int seq_len);
+Tensor3D positional_encoding_forward(PositionalEncoding *pe, int seq_len, int batch_size);
 
 EncoderLayer encoder_layer_create(int nhead, int d_model, int d_ff, float dropout);
 void encoder_layer_free(EncoderLayer *layer);

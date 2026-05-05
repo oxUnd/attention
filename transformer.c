@@ -518,12 +518,14 @@ void positional_encoding_free(PositionalEncoding *pe) {
     free(pe);
 }
 
-Tensor3D positional_encoding_forward(PositionalEncoding *pe, int seq_len) {
-    Tensor3D out = tensor_create(1, seq_len, pe->d_model);
+Tensor3D positional_encoding_forward(PositionalEncoding *pe, int seq_len, int batch_size) {
+    Tensor3D out = tensor_create(batch_size, seq_len, pe->d_model);
 
-    for (int i = 0; i < seq_len && i < pe->max_len; i++) {
-        for (int j = 0; j < pe->d_model; j++) {
-            out.data[i * pe->d_model + j] = pe->pe->data[i * pe->d_model + j];
+    for (int b = 0; b < batch_size; b++) {
+        for (int i = 0; i < seq_len && i < pe->max_len; i++) {
+            for (int j = 0; j < pe->d_model; j++) {
+                out.data[b * seq_len * pe->d_model + i * pe->d_model + j] = pe->pe->data[i * pe->d_model + j];
+            }
         }
     }
 
@@ -771,7 +773,7 @@ void encoder_free(Encoder *enc) {
 
 Tensor3D encoder_forward(Encoder *enc, Tensor3D *src, Tensor3D *src_mask, EncoderCache *cache) {
     Tensor3D x = clone_tensor(src);
-    Tensor3D pe = positional_encoding_forward(enc->pe, src->seq_len);
+    Tensor3D pe = positional_encoding_forward(enc->pe, src->seq_len, src->batch_size);
 
     for (int i = 0; i < src->batch_size * src->seq_len * src->d_model; i++) {
         x.data[i] += pe.data[i % (pe.seq_len * pe.d_model)];
@@ -824,7 +826,7 @@ Tensor3D decoder_forward(
     DecoderCache *cache
 ) {
     Tensor3D x = clone_tensor(tgt);
-    Tensor3D pe = positional_encoding_forward(dec->pe, tgt->seq_len);
+    Tensor3D pe = positional_encoding_forward(dec->pe, tgt->seq_len, tgt->batch_size);
 
     for (int i = 0; i < tgt->batch_size * tgt->seq_len * tgt->d_model; i++) {
         x.data[i] += pe.data[i % (pe.seq_len * pe.d_model)];
@@ -902,6 +904,7 @@ Tensor3D transformer_forward(
     Tensor3D src_proj = tensor_create(src->batch_size, src->seq_len, src->d_model);
     tensor_mat_mul(src, t->input_projection, &src_proj);
     if (cache) {
+        cache->src_input = clone_tensor(src);
         cache->src_proj = clone_tensor(&src_proj);
     }
 
@@ -916,6 +919,7 @@ Tensor3D transformer_forward(
     Tensor3D tgt_proj = tensor_create(tgt->batch_size, tgt->seq_len, tgt->d_model);
     tensor_mat_mul(tgt, t->input_projection, &tgt_proj);
     if (cache) {
+        cache->tgt_input = clone_tensor(tgt);
         cache->tgt_proj = clone_tensor(&tgt_proj);
     }
 
@@ -988,8 +992,6 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
     Tensor3D *attn_mask_unused, Tensor3D *grad_output, Tensor3D *grad_query, Tensor3D *grad_key,
     Tensor3D *grad_value, AttnCache *attn_cache, TrainingState *ts) {
     (void)attn_mask_unused;
-    (void)grad_key;
-    (void)grad_value;
     int b = query->batch_size;
     int s = query->seq_len;
     int d_k = attn->d_k;
@@ -997,6 +999,9 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
     int d_model = query->d_model;
 
     tensor_zero(grad_query);
+    if (grad_key && grad_key->data && grad_key->data != grad_query->data) tensor_zero(grad_key);
+    if (grad_value && grad_value->data && grad_value->data != grad_query->data
+        && grad_value->data != (grad_key ? grad_key->data : NULL)) tensor_zero(grad_value);
 
     Tensor3D grad_out_proj = tensor_create(b, s, d_model);
     tensor_zero(&grad_out_proj);
@@ -1058,7 +1063,6 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
     Tensor3D grad_scores = tensor_create(b, nhead, s * s);
     tensor_zero(&grad_scores);
 
-    Tensor3D grad_attn_probs = tensor_create(b, nhead, s * s);
     Tensor3D grad_v_reshaped = tensor_create(b, nhead, s * d_k);
     tensor_zero(&grad_v_reshaped);
 
@@ -1067,15 +1071,11 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
             for (int q = 0; q < s; q++) {
                 for (int kk = 0; kk < d_k; kk++) {
                     float gattend = grad_attend.data[i * nhead * s * d_k + h * s * d_k + q * d_k + kk];
-
-                    float gattn_sum = 0;
                     for (int t = 0; t < s; t++) {
                         float aw = attn_weights->data[i * nhead * s * s + h * s * s + q * s + t];
-                        gattn_sum += gattend * v_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk] * aw;
                         grad_v_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk] +=
                             aw * gattend;
                     }
-                    grad_attn_probs.data[i * nhead * s * s + h * s * s + q * s] = 0;
                 }
             }
         }
@@ -1083,34 +1083,27 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
 
     for (int i = 0; i < b; i++) {
         for (int h = 0; h < nhead; h++) {
-            for (int q = 0; q < s; q++) {
-                float dot_ga = 0;
-                for (int kk = 0; kk < d_k; kk++) {
-                    dot_ga += grad_attend.data[i * nhead * s * d_k + h * s * d_k + q * d_k + kk] *
-                              v_reshaped.data[i * nhead * s * d_k + h * s * d_k + q * d_k + kk];
-                }
-
+            for (int q_idx = 0; q_idx < s; q_idx++) {
                 for (int t = 0; t < s; t++) {
-                    float aw = attn_weights->data[i * nhead * s * s + h * s * s + q * s + t];
-                    float sum_ga_v = 0;
+                    float aw_qt = attn_weights->data[i * nhead * s * s + h * s * s + q_idx * s + t];
+                    float dot_ga_q_vq = 0;
+                    float dot_ga_q_vt = 0;
                     for (int kk = 0; kk < d_k; kk++) {
-                        sum_ga_v += grad_attend.data[i * nhead * s * d_k + h * s * d_k + q * d_k + kk] *
-                                    v_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk];
+                        float ga = grad_attend.data[i * nhead * s * d_k + h * s * d_k + q_idx * d_k + kk];
+                        dot_ga_q_vq += ga * v_reshaped.data[i * nhead * s * d_k + h * s * d_k + q_idx * d_k + kk];
+                        dot_ga_q_vt += ga * v_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk];
                     }
-
-                    float dot_ga_t = 0;
-                    for (int kk2 = 0; kk2 < d_k; kk2++) {
-                        dot_ga_t += grad_attend.data[i * nhead * s * d_k + h * s * d_k + q * d_k + kk2] *
-                                    v_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk2];
-                    }
-
-                    grad_scores.data[i * nhead * s * s + h * s * s + q * s + t] = aw * (dot_ga_t - dot_ga);
+                    grad_scores.data[i * nhead * s * s + h * s * s + q_idx * s + t] = aw_qt * (dot_ga_q_vt - dot_ga_q_vq);
                 }
             }
         }
     }
 
     float scale = 1.0f / sqrtf((float)d_k);
+
+    for (int i = 0; i < b * nhead * s * s; i++) {
+        grad_scores.data[i] *= scale;
+    }
 
     Tensor3D grad_q_reshaped = tensor_create(b, nhead, s * d_k);
     Tensor3D grad_k_reshaped = tensor_create(b, nhead, s * d_k);
@@ -1119,27 +1112,27 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
 
     for (int i = 0; i < b; i++) {
         for (int h = 0; h < nhead; h++) {
-            for (int q = 0; q < s; q++) {
+            for (int qi = 0; qi < s; qi++) {
                 for (int kk = 0; kk < d_k; kk++) {
                     float gq = 0, gk = 0;
                     for (int t = 0; t < s; t++) {
-                        float gs = grad_scores.data[i * nhead * s * s + h * s * s + q * s + t] * scale;
-                        gq += gs * k_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk];
-                        gk += grad_scores.data[i * nhead * s * s + h * s * s + t * s + q] * scale *
-                              q_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk];
+                        float gs_qt = grad_scores.data[i * nhead * s * s + h * s * s + qi * s + t];
+                        float gs_tq = grad_scores.data[i * nhead * s * s + h * s * s + t * s + qi];
+                        gq += gs_qt * k_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk];
+                        gk += gs_tq * q_reshaped.data[i * nhead * s * d_k + h * s * d_k + t * d_k + kk];
                     }
-                    grad_q_reshaped.data[i * nhead * s * d_k + h * s * d_k + q * d_k + kk] += gq;
-                    grad_k_reshaped.data[i * nhead * s * d_k + h * s * d_k + q * d_k + kk] += gk;
+                    grad_q_reshaped.data[i * nhead * s * d_k + h * s * d_k + qi * d_k + kk] += gq;
+                    grad_k_reshaped.data[i * nhead * s * d_k + h * s * d_k + qi * d_k + kk] += gk;
                 }
             }
         }
     }
 
     Tensor3D grad_q = tensor_create(b, s, d_model);
-    Tensor3D grad_k = tensor_create(b, s, d_model);
+    Tensor3D grad_k_mat = tensor_create(b, s, d_model);
     Tensor3D grad_v = tensor_create(b, s, d_model);
     tensor_zero(&grad_q);
-    tensor_zero(&grad_k);
+    tensor_zero(&grad_k_mat);
     tensor_zero(&grad_v);
 
     for (int i = 0; i < b; i++) {
@@ -1148,7 +1141,7 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
                 for (int kk = 0; kk < d_k; kk++) {
                     grad_q.data[i * s * d_model + j * d_model + h * d_k + kk] =
                         grad_q_reshaped.data[i * nhead * s * d_k + h * s * d_k + j * d_k + kk];
-                    grad_k.data[i * s * d_model + j * d_model + h * d_k + kk] =
+                    grad_k_mat.data[i * s * d_model + j * d_model + h * d_k + kk] =
                         grad_k_reshaped.data[i * nhead * s * d_k + h * s * d_k + j * d_k + kk];
                     grad_v.data[i * s * d_model + j * d_model + h * d_k + kk] =
                         grad_v_reshaped.data[i * nhead * s * d_k + h * s * d_k + j * d_k + kk];
@@ -1163,20 +1156,50 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
 
     mat_vec_mul_backward(attn->wq, attn_cache->input.data, grad_q.data, b, s, d_model, d_model,
                          grad_wq, grad_query->data);
-    if (grad_key && grad_key->data) {
-        mat_vec_mul_backward(attn->wk, attn_cache->key_input.data, grad_k.data, b, s, d_model, d_model,
+
+    int key_is_same_as_query = (grad_key && grad_key->data && grad_key->data == grad_query->data);
+    int val_is_same_as_query = (grad_value && grad_value->data && grad_value->data == grad_query->data);
+    int key_is_same_as_val = (grad_key && grad_value && grad_key->data && grad_value->data && grad_key->data == grad_value->data);
+
+    if (key_is_same_as_val && !key_is_same_as_query) {
+        Tensor3D grad_kv = tensor_create(b, s, d_model);
+        tensor_zero(&grad_kv);
+        mat_vec_mul_backward(attn->wk, attn_cache->key_input.data, grad_k_mat.data, b, s, d_model, d_model,
+                             grad_wk, grad_kv.data);
+        mat_vec_mul_backward(attn->wv, attn_cache->value_input.data, grad_v.data, b, s, d_model, d_model,
+                             grad_wv, grad_kv.data);
+        for (int i = 0; i < b * s * d_model; i++) {
+            grad_key->data[i] += grad_kv.data[i];
+        }
+        tensor_free(&grad_kv);
+    } else if (key_is_same_as_query) {
+        mat_vec_mul_backward(attn->wk, attn_cache->key_input.data, grad_k_mat.data, b, s, d_model, d_model,
+                             grad_wk, grad_query->data);
+    } else if (grad_key && grad_key->data) {
+        mat_vec_mul_backward(attn->wk, attn_cache->key_input.data, grad_k_mat.data, b, s, d_model, d_model,
                              grad_wk, grad_key->data);
     } else {
-        mat_vec_mul_backward(attn->wk, attn_cache->key_input.data, grad_k.data, b, s, d_model, d_model,
-                             grad_wk, grad_query->data);
+        mat_vec_mul_backward(attn->wk, attn_cache->key_input.data, grad_k_mat.data, b, s, d_model, d_model,
+                             grad_wk, NULL);
+        for (int i = 0; i < b * s * d_model; i++) {
+            grad_query->data[i] += grad_k_mat.data[i];
+        }
     }
-    if (grad_value && grad_value->data) {
-        mat_vec_mul_backward(attn->wv, attn_cache->value_input.data, grad_v.data, b, s, d_model, d_model,
-                             grad_wv, grad_value->data);
-    } else {
+
+    if (val_is_same_as_query) {
         mat_vec_mul_backward(attn->wv, attn_cache->value_input.data, grad_v.data, b, s, d_model, d_model,
                              grad_wv, grad_query->data);
+    } else if (grad_value && grad_value->data && !key_is_same_as_val) {
+        mat_vec_mul_backward(attn->wv, attn_cache->value_input.data, grad_v.data, b, s, d_model, d_model,
+                             grad_wv, grad_value->data);
+    } else if (!key_is_same_as_val) {
+        mat_vec_mul_backward(attn->wv, attn_cache->value_input.data, grad_v.data, b, s, d_model, d_model,
+                             grad_wv, NULL);
+        for (int i = 0; i < b * s * d_model; i++) {
+            grad_query->data[i] += grad_v.data[i];
+        }
     }
+
     tensor_free(&q_in);
     tensor_free(&k_in);
     tensor_free(&v_in);
@@ -1186,12 +1209,11 @@ void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3
     tensor_free(&grad_out_proj);
     tensor_free(&grad_attend);
     tensor_free(&grad_scores);
-    tensor_free(&grad_attn_probs);
     tensor_free(&grad_v_reshaped);
     tensor_free(&grad_q_reshaped);
     tensor_free(&grad_k_reshaped);
     tensor_free(&grad_q);
-    tensor_free(&grad_k);
+    tensor_free(&grad_k_mat);
     tensor_free(&grad_v);
 }
 
@@ -1276,7 +1298,7 @@ void encoder_layer_backward(
     Tensor3D grad_residual2 = clone_tensor(&grad_ln2);
     Tensor3D grad_ff = clone_tensor(&grad_ln2);
 
-    Tensor3D grad_ff_input = tensor_create(b, s, layer->ffn->d_ff);
+    Tensor3D grad_ff_input = tensor_create(b, s, d);
     tensor_zero(&grad_ff_input);
     feed_forward_backward(layer->ffn, &cache->ln1_out, &grad_ff, &grad_ff_input, &cache->ffn_hidden, ts);
     tensor_free(&grad_ff);
@@ -1299,7 +1321,7 @@ void encoder_layer_backward(
     tensor_free(&grad_ln1_in);
 
     multi_head_attn_backward(layer->self_attn, &cache->x, &cache->x, &cache->x, NULL,
-                              &grad_attn_out, grad_input, grad_input, grad_input, &cache->self_attn_cache, ts);
+                              &grad_attn_out, grad_input, NULL, NULL, &cache->self_attn_cache, ts);
 
     for (int i = 0; i < b * s * d; i++) {
         grad_input->data[i] += grad_attn_out.data[i];
@@ -1333,7 +1355,7 @@ void decoder_layer_backward(
     Tensor3D grad_residual3 = clone_tensor(&grad_ln3);
     Tensor3D grad_ff = clone_tensor(&grad_ln3);
 
-    Tensor3D grad_ff_input = tensor_create(b, s, layer->ffn->d_ff);
+    Tensor3D grad_ff_input = tensor_create(b, s, d);
     tensor_zero(&grad_ff_input);
     feed_forward_backward(layer->ffn, &cache->ln2_out, &grad_ff, &grad_ff_input, &cache->ffn_hidden, ts);
     tensor_free(&grad_ff);
@@ -1377,7 +1399,7 @@ void decoder_layer_backward(
     grad_input->data = (float *)calloc(b * s * d, sizeof(float));
 
     multi_head_attn_backward(layer->self_attn, &cache->x, &cache->x, &cache->x, NULL,
-                              &grad_self_input, grad_input, grad_input, grad_input, &cache->self_attn_cache, ts);
+                              &grad_self_input, grad_input, NULL, NULL, &cache->self_attn_cache, ts);
 
     for (int i = 0; i < b * s * d; i++) {
         grad_input->data[i] += grad_self_input.data[i];
@@ -1450,14 +1472,26 @@ void transformer_backward(
     }
 
     if (grad_input_proj) {
-        Tensor3D src = cache->src_proj;
+        Tensor3D src_in = cache->src_input;
         for (int b = 0; b < batch; b++) {
             for (int s = 0; s < seq; s++) {
                 for (int i = 0; i < d_model; i++) {
                     float g = grad_encoder_out.data[b * seq * d_model + s * d_model + i];
                     for (int j = 0; j < d_model; j++) {
                         grad_input_proj->data[i * d_model + j] +=
-                            g * src.data[b * seq * d_model + s * d_model + j];
+                            g * src_in.data[b * seq * d_model + s * d_model + j];
+                    }
+                }
+            }
+        }
+        Tensor3D tgt_in = cache->tgt_input;
+        for (int b = 0; b < batch; b++) {
+            for (int s = 0; s < seq; s++) {
+                for (int i = 0; i < d_model; i++) {
+                    float g = grad_decoder_out.data[b * seq * d_model + s * d_model + i];
+                    for (int j = 0; j < d_model; j++) {
+                        grad_input_proj->data[i * d_model + j] +=
+                            g * tgt_in.data[b * seq * d_model + s * d_model + j];
                     }
                 }
             }
@@ -1469,6 +1503,8 @@ void transformer_backward(
 }
 
 void transformer_cache_free(TransformerCache *cache, int encoder_layers, int decoder_layers) {
+    tensor_free(&cache->src_input);
+    tensor_free(&cache->tgt_input);
     tensor_free(&cache->src_proj);
     tensor_free(&cache->tgt_proj);
     tensor_free(&cache->decoder_out);
@@ -1664,13 +1700,17 @@ void training_state_zero_grads(TrainingState *ts) {
 }
 
 void training_state_update(TrainingState *ts) {
+    ts->optimizer.t++;
+    float lr_t = ts->optimizer.learning_rate * sqrtf(1.0f - powf(ts->optimizer.beta2, ts->optimizer.t)) / (1.0f - powf(ts->optimizer.beta1, ts->optimizer.t));
     for (int i = 0; i < ts->count; i++) {
-        adam_update_matrix(ts->entries[i].param, &ts->entries[i].grad,
-                          &ts->entries[i].adam_m, &ts->entries[i].adam_v,
-                          &ts->optimizer);
+        int size = ts->entries[i].param->rows * ts->entries[i].param->cols;
+        for (int j = 0; j < size; j++) {
+            ts->entries[i].adam_m.data[j] = ts->optimizer.beta1 * ts->entries[i].adam_m.data[j] + (1.0f - ts->optimizer.beta1) * ts->entries[i].grad.data[j];
+            ts->entries[i].adam_v.data[j] = ts->optimizer.beta2 * ts->entries[i].adam_v.data[j] + (1.0f - ts->optimizer.beta2) * ts->entries[i].grad.data[j] * ts->entries[i].grad.data[j];
+            ts->entries[i].param->data[j] -= lr_t * ts->entries[i].adam_m.data[j] / (sqrtf(ts->entries[i].adam_v.data[j]) + ts->optimizer.eps);
+        }
         matrix_zero(&ts->entries[i].grad);
     }
-    ts->optimizer.t = 0;
 }
 
 void training_state_clip_grads(TrainingState *ts, float max_norm) {
@@ -1693,12 +1733,12 @@ void training_state_clip_grads(TrainingState *ts, float max_norm) {
     }
 }
 
-LossResult cross_entropy_loss(Tensor3D *pred, int *targets, int vocab_size_unused) {
-    (void)vocab_size_unused;
+LossResult cross_entropy_loss(Tensor3D *pred, int *targets, int vocab_size) {
     LossResult result;
     int batch = pred->batch_size;
     int seq = pred->seq_len;
     int d_model = pred->d_model;
+    int vsize = vocab_size > 0 && vocab_size < d_model ? vocab_size : d_model;
 
     result.loss = 0;
     result.grad = tensor_create(batch, seq, d_model);
@@ -1707,24 +1747,24 @@ LossResult cross_entropy_loss(Tensor3D *pred, int *targets, int vocab_size_unuse
     for (int b = 0; b < batch; b++) {
         for (int s = 0; s < seq; s++) {
             float max_val = -1e9f;
-            for (int v = 0; v < d_model; v++) {
+            for (int v = 0; v < vsize; v++) {
                 int i = b * seq * d_model + s * d_model + v;
                 if (pred->data[i] > max_val) max_val = pred->data[i];
             }
 
             float sum = 0;
-            for (int v = 0; v < d_model; v++) {
+            for (int v = 0; v < vsize; v++) {
                 int i = b * seq * d_model + s * d_model + v;
                 sum += expf(pred->data[i] - max_val);
             }
 
             int target = targets[b * seq + s];
-            for (int v = 0; v < d_model; v++) {
+            for (int v = 0; v < vsize; v++) {
                 int i = b * seq * d_model + s * d_model + v;
                 float prob = expf(pred->data[i] - max_val) / sum;
-                result.grad.data[i] = prob;
+                result.grad.data[i] = prob / (batch * seq);
                 if (v == target) {
-                    result.grad.data[i] -= 1.0f;
+                    result.grad.data[i] -= 1.0f / (batch * seq);
                     result.loss -= logf(prob + 1e-8f);
                 }
             }
@@ -1843,7 +1883,62 @@ void trainer_save(Trainer *trainer, const char *filename) {
 }
 
 Trainer trainer_load(const char *filename) {
-    (void)filename;
     Trainer trainer = {0};
+    FILE *f = fopen(filename, "rb");
+    if (!f) return trainer;
+
+    TransformerConfig config;
+    if (fread(&config, sizeof(TransformerConfig), 1, f) != 1) {
+        fclose(f);
+        return trainer;
+    }
+
+    Transformer *t = transformer_create(&config);
+    trainer.model = t;
+    trainer.learning_rate = config.d_model > 0 ? 0.001f : 0.001f;
+    trainer.ts = training_state_create(t, 0.001f, 0.9f, 0.999f, 1e-8f);
+
+    for (int i = 0; i < t->encoder->num_layers; i++) {
+        EncoderLayer *l = &t->encoder->layers[i];
+        fread(l->self_attn->wq->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->self_attn->wk->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->self_attn->wv->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->self_attn->wq_out->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->ffn->w1->data, sizeof(float), config.d_model * l->ffn->d_ff, f);
+        fread(l->ffn->b1->data, sizeof(float), l->ffn->d_ff, f);
+        fread(l->ffn->w2->data, sizeof(float), l->ffn->d_ff * config.d_model, f);
+        fread(l->ffn->b2->data, sizeof(float), config.d_model, f);
+        fread(l->ln1_gamma->data, sizeof(float), config.d_model, f);
+        fread(l->ln1_beta->data, sizeof(float), config.d_model, f);
+        fread(l->ln2_gamma->data, sizeof(float), config.d_model, f);
+        fread(l->ln2_beta->data, sizeof(float), config.d_model, f);
+    }
+
+    for (int i = 0; i < t->decoder->num_layers; i++) {
+        DecoderLayer *l = &t->decoder->layers[i];
+        fread(l->self_attn->wq->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->self_attn->wk->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->self_attn->wv->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->self_attn->wq_out->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->cross_attn->wq->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->cross_attn->wk->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->cross_attn->wv->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->cross_attn->wq_out->data, sizeof(float), config.d_model * config.d_model, f);
+        fread(l->ffn->w1->data, sizeof(float), config.d_model * l->ffn->d_ff, f);
+        fread(l->ffn->b1->data, sizeof(float), l->ffn->d_ff, f);
+        fread(l->ffn->w2->data, sizeof(float), l->ffn->d_ff * config.d_model, f);
+        fread(l->ffn->b2->data, sizeof(float), config.d_model, f);
+        fread(l->ln1_gamma->data, sizeof(float), config.d_model, f);
+        fread(l->ln1_beta->data, sizeof(float), config.d_model, f);
+        fread(l->ln2_gamma->data, sizeof(float), config.d_model, f);
+        fread(l->ln2_beta->data, sizeof(float), config.d_model, f);
+        fread(l->ln3_gamma->data, sizeof(float), config.d_model, f);
+        fread(l->ln3_beta->data, sizeof(float), config.d_model, f);
+    }
+
+    fread(t->input_projection->data, sizeof(float), config.d_model * config.d_model, f);
+    fread(t->output_projection->data, sizeof(float), config.d_model * config.d_model, f);
+
+    fclose(f);
     return trainer;
 }

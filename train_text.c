@@ -6,12 +6,12 @@
 #include <math.h>
 
 #define VOCAB_SIZE 28
-#define SEQ_LEN 32
-#define D_MODEL VOCAB_SIZE
+#define SEQ_LEN 16
+#define D_MODEL 64
 #define BATCH_SIZE 4
-#define NUM_EPOCHS 5000
-#define D_FF 256
-#define NHEAD 2
+#define NUM_EPOCHS 10000
+#define D_FF 128
+#define NHEAD 4
 
 static const char CHARS[] = "abcdefghijklmnopqrstuvwxyz .";
 
@@ -69,13 +69,15 @@ static void encode_onehot(int idx, float *dst) {
     }
 }
 
-static void generate_text_batch(Tensor3D *src, Tensor3D *tgt, int *targets) {
+static void generate_text_batch(Tensor3D *src, Tensor3D *tgt, int *targets, int d_model) {
     for (int b = 0; b < BATCH_SIZE; b++) {
         int start = rand() % (corpus_len - SEQ_LEN - 1);
         for (int s = 0; s < SEQ_LEN; s++) {
             int ci = corpus_idx[start + s];
-            encode_onehot(ci, &src->data[b * SEQ_LEN * D_MODEL + s * D_MODEL]);
-            encode_onehot(ci, &tgt->data[b * SEQ_LEN * D_MODEL + s * D_MODEL]);
+            for (int d = 0; d < d_model; d++) {
+                src->data[b * SEQ_LEN * d_model + s * d_model + d] = (d == ci) ? 1.0f : 0.0f;
+                tgt->data[b * SEQ_LEN * d_model + s * d_model + d] = (d == ci) ? 1.0f : 0.0f;
+            }
             targets[b * SEQ_LEN + s] = corpus_idx[start + s + 1];
         }
     }
@@ -86,7 +88,7 @@ static float compute_accuracy(Tensor3D *output, int *targets) {
     int total = BATCH_SIZE * SEQ_LEN;
     for (int b = 0; b < BATCH_SIZE; b++) {
         for (int s = 0; s < SEQ_LEN; s++) {
-            int offset = b * SEQ_LEN * D_MODEL + s * D_MODEL;
+            int offset = b * SEQ_LEN * output->d_model + s * output->d_model;
             int pred = 0;
             float max_val = output->data[offset];
             for (int v = 1; v < VOCAB_SIZE; v++) {
@@ -121,7 +123,7 @@ static int sample_output(float *logits, int size, float temperature) {
     return size - 1;
 }
 
-static void generate_text(Transformer *model, const char *seed, int length, float temperature) {
+static void generate_text(Transformer *model, const char *seed, int length, float temperature, int d_model) {
     int seed_len = strlen(seed);
     int buf_cap = seed_len + length;
     int *buf = malloc(buf_cap * sizeof(int));
@@ -137,17 +139,20 @@ static void generate_text(Transformer *model, const char *seed, int length, floa
         int start = (buf_len > SEQ_LEN) ? (buf_len - SEQ_LEN) : 0;
         int seq_len = buf_len - start;
 
-        Tensor3D src = tensor_create(1, seq_len, D_MODEL);
-        Tensor3D tgt = tensor_create(1, seq_len, D_MODEL);
+        Tensor3D src = tensor_create(1, seq_len, d_model);
+        Tensor3D tgt = tensor_create(1, seq_len, d_model);
 
         for (int s = 0; s < seq_len; s++) {
-            encode_onehot(buf[start + s], &src.data[s * D_MODEL]);
-            encode_onehot(buf[start + s], &tgt.data[s * D_MODEL]);
+            int ci = buf[start + s];
+            for (int d = 0; d < d_model; d++) {
+                src.data[s * d_model + d] = (d == ci) ? 1.0f : 0.0f;
+                tgt.data[s * d_model + d] = (d == ci) ? 1.0f : 0.0f;
+            }
         }
 
         Tensor3D output = transformer_forward(model, &src, &tgt, NULL, NULL, NULL);
 
-        int pred = sample_output(&output.data[(seq_len - 1) * D_MODEL], D_MODEL, temperature);
+        int pred = sample_output(&output.data[(seq_len - 1) * d_model], VOCAB_SIZE, temperature);
         buf[buf_len++] = pred;
         printf("%c", idx_to_char(pred));
         fflush(stdout);
@@ -175,15 +180,15 @@ int main(void) {
         .d_model = D_MODEL,
         .nhead = NHEAD,
         .d_ff = D_FF,
-        .encoder_layers = 2,
-        .decoder_layers = 2,
+        .encoder_layers = 1,
+        .decoder_layers = 1,
         .max_len = SEQ_LEN + 5,
         .dropout = 0.0f,
         .activation = GELU
     };
 
     Transformer *model = transformer_create(&config);
-    TrainingState *ts = training_state_create(model, 0.001f, 0.9f, 0.999f, 1e-8f);
+    TrainingState *ts = training_state_create(model, 0.003f, 0.9f, 0.999f, 1e-8f);
 
     Tensor3D src = tensor_create(BATCH_SIZE, SEQ_LEN, D_MODEL);
     Tensor3D tgt = tensor_create(BATCH_SIZE, SEQ_LEN, D_MODEL);
@@ -193,7 +198,7 @@ int main(void) {
     int no_improve = 0;
 
     for (int epoch = 0; epoch < NUM_EPOCHS; epoch++) {
-        generate_text_batch(&src, &tgt, targets);
+        generate_text_batch(&src, &tgt, targets, D_MODEL);
 
         training_state_zero_grads(ts);
 
@@ -231,16 +236,16 @@ int main(void) {
     printf("\n=== Training Complete ===\n\n");
 
     printf("--- Temperature 0.5 (conservative) ---\n");
-    generate_text(model, "the ", 80, 0.5f);
+    generate_text(model, "the ", 60, 0.5f, D_MODEL);
 
     printf("--- Temperature 1.0 (balanced) ---\n");
-    generate_text(model, "the ", 80, 1.0f);
+    generate_text(model, "the ", 60, 1.0f, D_MODEL);
 
     printf("--- Temperature 1.5 (creative) ---\n");
-    generate_text(model, "the ", 80, 1.5f);
+    generate_text(model, "the ", 60, 1.5f, D_MODEL);
 
     printf("--- Different seed: \"she \" ---\n");
-    generate_text(model, "she ", 80, 0.8f);
+    generate_text(model, "she ", 60, 0.8f, D_MODEL);
 
     tensor_free(&src);
     tensor_free(&tgt);
