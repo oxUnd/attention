@@ -65,6 +65,12 @@ void matrix_free(Matrix *m) {
     m->data = NULL;
 }
 
+void matrix_zero(Matrix *m) {
+    for (int i = 0; i < m->rows * m->cols; i++) {
+        m->data[i] = 0.0f;
+    }
+}
+
 void matrix_rand(Matrix *m) {
     for (int i = 0; i < m->rows * m->cols; i++) {
         m->data[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
@@ -975,6 +981,7 @@ Tensor3D transformer_forward(
     Tensor3D decoder_out;
     if (cache) {
         decoder_out = decoder_forward(t->decoder, &tgt_proj, &encoder_out, src_mask, tgt_mask, &cache->decoder_cache);
+        cache->decoder_out = clone_tensor(&decoder_out);
     } else {
         decoder_out = decoder_forward(t->decoder, &tgt_proj, &encoder_out, src_mask, tgt_mask, NULL);
         tensor_free(&tgt_proj);
@@ -984,7 +991,7 @@ Tensor3D transformer_forward(
     Tensor3D out = tensor_create(decoder_out.batch_size, decoder_out.seq_len, t->config.d_model);
     tensor_mat_mul(&decoder_out, t->output_projection, &out);
     if (!cache) tensor_free(&decoder_out);
-
+    
     return out;
 }
 
@@ -994,45 +1001,117 @@ void transformer_backward(
     Tensor3D *grad,
     Tensor3D *tgt
 ) {
-    // Backward through output projection
-    Tensor3D grad_decoder_out = tensor_create(grad->batch_size, grad->seq_len, grad->d_model);
-    tensor_zero(&grad_decoder_out);
-    for (int i = 0; i < grad->batch_size * grad->seq_len * grad->d_model; i++) {
-        grad_decoder_out.data[i] = grad->data[i];
-    }
-
-    // Backward through decoder
-    Tensor3D grad_tgt_proj = tensor_create(tgt->batch_size, tgt->seq_len, tgt->d_model);
-    tensor_zero(&grad_tgt_proj);
+    (void)tgt; // 暂未使用
     
+    // ===== 1. 反向传播通过输出投影层 =====
+    // grad_output = grad (来自损失函数)
+    // 需要计算:
+    //   grad_decoder_out = grad * W_out^T
+    //   grad_W_out = decoder_out^T * grad
+    
+    Tensor3D decoder_out = cache->decoder_out;  // 缓存的解码器输出
+    int batch = grad->batch_size;
+    int seq = grad->seq_len;
+    int d_model = grad->d_model;
+    
+    // 计算输出层梯度: grad_W = grad^T * decoder_out (简化版)
+    Matrix grad_w = matrix_create(d_model, d_model);
+    matrix_zero(&grad_w);
+    
+    for (int b = 0; b < batch; b++) {
+        for (int s = 0; s < seq; s++) {
+            for (int i = 0; i < d_model; i++) {
+                float g = grad->data[b * seq * d_model + s * d_model + i];
+                for (int j = 0; j < d_model; j++) {
+                    float inp = decoder_out.data[b * seq * d_model + s * d_model + j];
+                    grad_w.data[i * d_model + j] += g * inp;
+                }
+            }
+        }
+    }
+    
+    // 使用 Adam 更新输出投影层
+    // 为简化，直接修改输出层权重（添加动量矩阵到 Transformer 结构会更完整）
+    static Matrix m_moment_out, v_moment_out;
+    static int moment_initialized = 0;
+    if (!moment_initialized) {
+        m_moment_out = matrix_create(d_model, d_model);
+        v_moment_out = matrix_create(d_model, d_model);
+        matrix_zero(&m_moment_out);
+        matrix_zero(&v_moment_out);
+        moment_initialized = 1;
+    }
+    
+    // 创建优化器并更新
+    AdamOptimizer opt = adam_create(0.001f, 0.9f, 0.999f, 1e-8f);
+    opt.t = 1;  // 简化：每次都当作第1步
+    adam_update_matrix(t->output_projection, &grad_w, &m_moment_out, &v_moment_out, &opt);
+    matrix_free(&grad_w);
+    
+    // ===== 2. 计算 decoder 输出的梯度 =====
+    // grad_decoder_out = grad * W_out^T
+    Tensor3D grad_decoder_out = tensor_create(batch, seq, d_model);
+    tensor_zero(&grad_decoder_out);
+    for (int b = 0; b < batch; b++) {
+        for (int s = 0; s < seq; s++) {
+            for (int i = 0; i < d_model; i++) {
+                float g = grad->data[b * seq * d_model + s * d_model + i];
+                for (int j = 0; j < d_model; j++) {
+                    grad_decoder_out.data[b * seq * d_model + s * d_model + j] += g * t->output_projection->data[i * d_model + j];
+                }
+            }
+        }
+    }
+    
+    // ===== 3. 反向传播通过 Decoder 层 =====
     for (int i = t->decoder->num_layers - 1; i >= 0; i--) {
         DecoderLayerCache *dlc = &cache->decoder_cache.layer_caches[i];
-        Tensor3D grad_input = tensor_create(tgt->batch_size, tgt->seq_len, tgt->d_model);
+        Tensor3D grad_input = tensor_create(batch, seq, d_model);
         tensor_zero(&grad_input);
         decoder_layer_backward(&t->decoder->layers[i], dlc, &grad_decoder_out, &grad_input);
         tensor_free(&grad_decoder_out);
         grad_decoder_out = grad_input;
     }
     
-    // Backward through encoder
+    // ===== 4. 反向传播通过 Encoder 层 =====
     Tensor3D grad_encoder_out = clone_tensor(&cache->decoder_cache.encoder_out);
     
     for (int i = t->encoder->num_layers - 1; i >= 0; i--) {
         EncoderLayerCache *elc = &cache->encoder_cache.layer_caches[i];
-        Tensor3D grad_input = tensor_create(tgt->batch_size, tgt->seq_len, tgt->d_model);
+        Tensor3D grad_input = tensor_create(batch, seq, d_model);
         tensor_zero(&grad_input);
         encoder_layer_backward(&t->encoder->layers[i], elc, &grad_encoder_out, &grad_input);
         tensor_free(&grad_encoder_out);
         grad_encoder_out = grad_input;
     }
     
+    // ===== 5. 清理缓存 =====
     tensor_free(&grad_decoder_out);
-    tensor_free(&grad_tgt_proj);
     tensor_free(&grad_encoder_out);
     tensor_free(&cache->src_proj);
     tensor_free(&cache->tgt_proj);
+    tensor_free(&cache->decoder_out);
     tensor_free(&cache->decoder_cache.encoder_out);
+    
+    for (int i = 0; i < cache->encoder_cache.num_layers; i++) {
+        tensor_free(&cache->encoder_cache.layer_caches[i].x);
+        tensor_free(&cache->encoder_cache.layer_caches[i].residual);
+        tensor_free(&cache->encoder_cache.layer_caches[i].ln1_out);
+        tensor_free(&cache->encoder_cache.layer_caches[i].ff_out);
+        tensor_free(&cache->encoder_cache.layer_caches[i].ln2_out);
+    }
     free(cache->encoder_cache.layer_caches);
+    
+    for (int i = 0; i < cache->decoder_cache.num_layers; i++) {
+        tensor_free(&cache->decoder_cache.layer_caches[i].x);
+        tensor_free(&cache->decoder_cache.layer_caches[i].residual1);
+        tensor_free(&cache->decoder_cache.layer_caches[i].ln1_out);
+        tensor_free(&cache->decoder_cache.layer_caches[i].residual2);
+        tensor_free(&cache->decoder_cache.layer_caches[i].ln2_out);
+        tensor_free(&cache->decoder_cache.layer_caches[i].ff_out);
+        tensor_free(&cache->decoder_cache.layer_caches[i].ln3_out);
+        tensor_free(&cache->decoder_cache.layer_caches[i].encoder_out);
+    }
     free(cache->decoder_cache.layer_caches);
 }
 
@@ -1373,44 +1452,11 @@ void trainer_train_step(Trainer *trainer, Tensor3D *src, Tensor3D *tgt, int *tar
     loss_print(&loss, "train_step");
 
     // Backward pass
-    Tensor3D grad = tensor_create(output.batch_size, output.seq_len, output.d_model);
-    for (int i = 0; i < output.batch_size * output.seq_len * output.d_model; i++) {
-        grad.data[i] = loss.grad.data[i];
-    }
-    
-    Tensor3D grad_input = tensor_create(tgt->batch_size, tgt->seq_len, tgt->d_model);
-    tensor_zero(&grad_input);
-    transformer_backward(trainer->model, &cache, &grad, tgt);
-    
-    // Update model parameters using Adam
-    // (Simplified: full implementation would update all parameters)
-    
+    transformer_backward(trainer->model, &cache, &loss.grad, tgt);
+
     // Cleanup
-    tensor_free(&grad);
-    tensor_free(&grad_input);
     tensor_free(&output);
     tensor_free(&loss.grad);
-    tensor_free(&cache.src_proj);
-    tensor_free(&cache.tgt_proj);
-    for (int i = 0; i < cache.encoder_cache.num_layers; i++) {
-        tensor_free(&cache.encoder_cache.layer_caches[i].x);
-        tensor_free(&cache.encoder_cache.layer_caches[i].residual);
-        tensor_free(&cache.encoder_cache.layer_caches[i].ln1_out);
-        tensor_free(&cache.encoder_cache.layer_caches[i].ff_out);
-        tensor_free(&cache.encoder_cache.layer_caches[i].ln2_out);
-    }
-    free(cache.encoder_cache.layer_caches);
-    for (int i = 0; i < cache.decoder_cache.num_layers; i++) {
-        tensor_free(&cache.decoder_cache.layer_caches[i].x);
-        tensor_free(&cache.decoder_cache.layer_caches[i].residual1);
-        tensor_free(&cache.decoder_cache.layer_caches[i].ln1_out);
-        tensor_free(&cache.decoder_cache.layer_caches[i].residual2);
-        tensor_free(&cache.decoder_cache.layer_caches[i].ln2_out);
-        tensor_free(&cache.decoder_cache.layer_caches[i].ff_out);
-        tensor_free(&cache.decoder_cache.layer_caches[i].ln3_out);
-        tensor_free(&cache.decoder_cache.layer_caches[i].encoder_out);
-    }
-    free(cache.decoder_cache.layer_caches);
 }
 
 void trainer_train_epoch(Trainer *trainer, Tensor3D *src, Tensor3D *tgt, int *targets, int vocab_size, int epochs) {

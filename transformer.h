@@ -149,6 +149,7 @@ typedef struct {
     DecoderCache decoder_cache;
     Tensor3D src_proj;
     Tensor3D tgt_proj;
+    Tensor3D decoder_out;  // Cache decoder output before final projection
 } TransformerCache;
 
 void tensor_zero(Tensor3D *t);
