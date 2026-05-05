@@ -205,7 +205,7 @@ int main(void) {
             printf("Epoch %d: loss=%.4f, acc=%.1f%%\n", epoch, loss.loss, acc);
         }
 
-        transformer_backward(model, &cache, &loss.grad, &tgt, &trainer.optimizer);
+        transformer_backward(model, &cache, &loss.grad, &tgt);
 
         tensor_free(&output);
         tensor_free(&loss.grad);

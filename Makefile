@@ -6,8 +6,9 @@ TARGET = transformer
 TRAIN_TARGET = train_copy_task
 SIMPLE_TARGET = train_simple
 FULL_TARGET = train_full
+TEXT_TARGET = train_text
 
-all: $(TARGET) $(TRAIN_TARGET) $(SIMPLE_TARGET) $(FULL_TARGET)
+all: $(TARGET) $(TRAIN_TARGET) $(SIMPLE_TARGET) $(FULL_TARGET) $(TEXT_TARGET)
 
 $(TARGET): transformer.o main.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
@@ -19,6 +20,10 @@ $(SIMPLE_TARGET): transformer.o train_simple.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(FULL_TARGET): transformer.o train_full.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+
+$(TEXT_TARGET): transformer.o train_text.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 %.o: %.c transformer.h
