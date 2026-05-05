@@ -1831,9 +1831,11 @@ void trainer_train_epoch(Trainer *trainer, Tensor3D *src, Tensor3D *tgt, int *ta
     }
 }
 
-void trainer_save(Trainer *trainer, const char *filename) {
+int trainer_save(Trainer *trainer, const char *filename) {
     FILE *f = fopen(filename, "wb");
-    if (!f) return;
+    if (!f) {
+        return -1;
+    }
 
     Transformer *t = trainer->model;
     fwrite(&t->config, sizeof(TransformerConfig), 1, f);
@@ -1880,6 +1882,7 @@ void trainer_save(Trainer *trainer, const char *filename) {
     fwrite(t->output_projection->data, sizeof(float), t->config.d_model * t->config.d_model, f);
 
     fclose(f);
+    return 0;
 }
 
 Trainer trainer_load(const char *filename) {

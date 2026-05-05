@@ -278,7 +278,7 @@ Trainer trainer_create(Transformer *model, float lr, float beta1, float beta2, f
 void trainer_free(Trainer *trainer);
 void trainer_train_step(Trainer *trainer, Tensor3D *src, Tensor3D *tgt, int *targets, int vocab_size);
 void trainer_train_epoch(Trainer *trainer, Tensor3D *src, Tensor3D *tgt, int *targets, int vocab_size, int epochs);
-void trainer_save(Trainer *trainer, const char *filename);
+int trainer_save(Trainer *trainer, const char *filename);
 Trainer trainer_load(const char *filename);
 
 #endif
