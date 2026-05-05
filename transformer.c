@@ -767,6 +767,10 @@ Tensor3D decoder_layer_forward(
     }
     tensor_layer_norm(&residual1, layer->ln1_gamma, layer->ln1_beta, 1e-5f);
 
+    if (cache) {
+        cache->ln1_out = clone_tensor(&residual1);
+    }
+
     Tensor3D cross_out = multi_head_attn_forward(layer->cross_attn, &residual1, encoder_out, encoder_out, src_mask);
 
     // Residual + LayerNorm
@@ -780,6 +784,10 @@ Tensor3D decoder_layer_forward(
         cache->residual2 = clone_tensor(&residual2);
     }
     tensor_layer_norm(&residual2, layer->ln2_gamma, layer->ln2_beta, 1e-5f);
+
+    if (cache) {
+        cache->ln2_out = clone_tensor(&residual2);
+    }
 
     Tensor3D ff_out = feed_forward_forward(layer->ffn, &residual2);
 
