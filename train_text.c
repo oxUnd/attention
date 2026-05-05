@@ -9,7 +9,8 @@
 #define SEQ_LEN 16
 #define D_MODEL 64
 #define BATCH_SIZE 4
-#define NUM_EPOCHS 10000
+#define MAX_EPOCHS 120
+#define EARLY_STOP_PATIENCE 18
 #define D_FF 128
 #define NHEAD 4
 
@@ -63,15 +64,12 @@ static void preprocess_corpus(void) {
     }
 }
 
-static void encode_onehot(int idx, float *dst) {
-    for (int d = 0; d < D_MODEL; d++) {
-        dst[d] = (d == idx) ? 1.0f : 0.0f;
-    }
-}
-
-static void generate_text_batch(Tensor3D *src, Tensor3D *tgt, int *targets, int d_model) {
+/* Valid window starts: 0 .. corpus_len - SEQ_LEN - 1 (inclusive), count = corpus_len - SEQ_LEN. */
+static void generate_text_batch_at(
+    Tensor3D *src, Tensor3D *tgt, int *targets, int d_model, const int *starts
+) {
     for (int b = 0; b < BATCH_SIZE; b++) {
-        int start = rand() % (corpus_len - SEQ_LEN - 1);
+        int start = starts[b];
         for (int s = 0; s < SEQ_LEN; s++) {
             int ci = corpus_idx[start + s];
             for (int d = 0; d < d_model; d++) {
@@ -80,6 +78,15 @@ static void generate_text_batch(Tensor3D *src, Tensor3D *tgt, int *targets, int 
             }
             targets[b * SEQ_LEN + s] = corpus_idx[start + s + 1];
         }
+    }
+}
+
+static void shuffle_int_range(int *a, int n) {
+    for (int i = n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int t = a[i];
+        a[i] = a[j];
+        a[j] = t;
     }
 }
 
@@ -187,51 +194,94 @@ int main(void) {
         .activation = GELU
     };
 
+    int n_starts = corpus_len - SEQ_LEN;
+    if (n_starts < BATCH_SIZE) {
+        fprintf(stderr, "Corpus too short for SEQ_LEN=%d (need at least %d chars).\n", SEQ_LEN,
+                SEQ_LEN + BATCH_SIZE);
+        return 1;
+    }
+
+    int *window_order = malloc((size_t)n_starts * sizeof(int));
+    if (!window_order) {
+        perror("malloc");
+        return 1;
+    }
+    for (int i = 0; i < n_starts; i++) {
+        window_order[i] = i;
+    }
+
+    int num_batches = n_starts / BATCH_SIZE;
+
     Transformer *model = transformer_create(&config);
-    TrainingState *ts = training_state_create(model, 0.003f, 0.9f, 0.999f, 1e-8f);
+    TrainingState *ts = training_state_create(model, 0.002f, 0.9f, 0.999f, 1e-8f);
 
     Tensor3D src = tensor_create(BATCH_SIZE, SEQ_LEN, D_MODEL);
     Tensor3D tgt = tensor_create(BATCH_SIZE, SEQ_LEN, D_MODEL);
     int targets[BATCH_SIZE * SEQ_LEN];
 
-    float prev_loss = 1e9f;
-    int no_improve = 0;
+    float best_avg_loss = 1e9f;
+    int patience = 0;
 
-    for (int epoch = 0; epoch < NUM_EPOCHS; epoch++) {
-        generate_text_batch(&src, &tgt, targets, D_MODEL);
+    printf("Windows per epoch: %d (%d gradient steps), max epochs: %d\n\n", n_starts, num_batches,
+           MAX_EPOCHS);
 
-        training_state_zero_grads(ts);
+    for (int epoch = 0; epoch < MAX_EPOCHS; epoch++) {
+        shuffle_int_range(window_order, n_starts);
 
-        TransformerCache cache = {0};
-        Tensor3D output = transformer_forward(model, &src, &tgt, NULL, NULL, &cache);
+        float sum_loss = 0.0f;
+        float sum_acc = 0.0f;
 
-        LossResult loss = cross_entropy_loss(&output, targets, VOCAB_SIZE);
-        float acc = compute_accuracy(&output, targets);
+        for (int bi = 0; bi < num_batches; bi++) {
+            int starts[BATCH_SIZE];
+            int base = bi * BATCH_SIZE;
+            for (int b = 0; b < BATCH_SIZE; b++) {
+                starts[b] = window_order[base + b];
+            }
 
-        if (epoch % 500 == 0 || loss.loss < 1.5f) {
-            printf("Epoch %d: loss=%.4f, acc=%.1f%%\n", epoch, loss.loss, acc);
+            generate_text_batch_at(&src, &tgt, targets, D_MODEL, starts);
+
+            training_state_zero_grads(ts);
+
+            TransformerCache cache = {0};
+            Tensor3D output = transformer_forward(model, &src, &tgt, NULL, NULL, &cache);
+
+            LossResult loss = cross_entropy_loss(&output, targets, VOCAB_SIZE);
+            float acc = compute_accuracy(&output, targets);
+
+            sum_loss += loss.loss;
+            sum_acc += acc;
+
+            transformer_backward(model, &cache, &loss.grad, &tgt, ts);
+            training_state_clip_grads(ts, 1.0f);
+            training_state_update(ts);
+
+            transformer_cache_free(&cache, config.encoder_layers, config.decoder_layers);
+            tensor_free(&output);
+            tensor_free(&loss.grad);
         }
 
-        transformer_backward(model, &cache, &loss.grad, &tgt, ts);
-        training_state_clip_grads(ts, 1.0f);
-        training_state_update(ts);
+        float avg_loss = sum_loss / (float)num_batches;
+        float avg_acc = sum_acc / (float)num_batches;
 
-        transformer_cache_free(&cache, config.encoder_layers, config.decoder_layers);
-        tensor_free(&output);
-        tensor_free(&loss.grad);
+        if (epoch % 5 == 0 || epoch == MAX_EPOCHS - 1 || avg_loss < 1.2f) {
+            printf("Epoch %4d: avg_loss=%.4f avg_acc=%.1f%%\n", epoch, avg_loss, avg_acc);
+        }
 
-        if (loss.loss < prev_loss - 0.0001f) {
-            no_improve = 0;
+        if (avg_loss < best_avg_loss - 0.002f) {
+            best_avg_loss = avg_loss;
+            patience = 0;
         } else {
-            no_improve++;
+            patience++;
         }
-        prev_loss = loss.loss;
 
-        if (no_improve > 800 || loss.loss < 0.3f) {
-            printf("Early stop at epoch %d: loss=%.4f, acc=%.1f%%\n", epoch, loss.loss, acc);
+        if (patience >= EARLY_STOP_PATIENCE || avg_loss < 0.35f) {
+            printf("Stopped at epoch %d: avg_loss=%.4f avg_acc=%.1f%% (%s)\n", epoch, avg_loss,
+                   avg_acc, patience >= EARLY_STOP_PATIENCE ? "patience" : "loss threshold");
             break;
         }
     }
+
+    free(window_order);
 
     printf("\n=== Training Complete ===\n\n");
 
