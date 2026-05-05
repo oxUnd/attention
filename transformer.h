@@ -6,6 +6,7 @@
 
 #define MAX_SEQ_LEN 512
 #define MAX_BATCH_SIZE 64
+#define MAX_PARAMS 128
 
 typedef enum {
     DIM_LAYER,
@@ -14,6 +15,14 @@ typedef enum {
     GEOF,
     SILU,
 } Activation;
+
+typedef struct {
+    float learning_rate;
+    float beta1;
+    float beta2;
+    float eps;
+    int t;
+} AdamOptimizer;
 
 typedef struct {
     int d_model;
@@ -112,13 +121,21 @@ typedef struct {
     Matrix *output_projection;
 } Transformer;
 
-// Cache structures for backward pass
+typedef struct {
+    Tensor3D attn_weights;
+    Tensor3D input;
+    Tensor3D key_input;
+    Tensor3D value_input;
+} AttnCache;
+
 typedef struct {
     Tensor3D x;
     Tensor3D residual;
     Tensor3D ln1_out;
+    Tensor3D ffn_hidden;
     Tensor3D ff_out;
     Tensor3D ln2_out;
+    AttnCache self_attn_cache;
 } EncoderLayerCache;
 
 typedef struct {
@@ -132,9 +149,12 @@ typedef struct {
     Tensor3D ln1_out;
     Tensor3D residual2;
     Tensor3D ln2_out;
+    Tensor3D ffn_hidden;
     Tensor3D ff_out;
     Tensor3D ln3_out;
     Tensor3D encoder_out;
+    AttnCache self_attn_cache;
+    AttnCache cross_attn_cache;
 } DecoderLayerCache;
 
 typedef struct {
@@ -149,8 +169,21 @@ typedef struct {
     DecoderCache decoder_cache;
     Tensor3D src_proj;
     Tensor3D tgt_proj;
-    Tensor3D decoder_out;  // Cache decoder output before final projection
+    Tensor3D decoder_out;
 } TransformerCache;
+
+typedef struct {
+    Matrix *param;
+    Matrix grad;
+    Matrix adam_m;
+    Matrix adam_v;
+} ParamEntry;
+
+typedef struct {
+    ParamEntry entries[MAX_PARAMS];
+    int count;
+    AdamOptimizer optimizer;
+} TrainingState;
 
 void tensor_zero(Tensor3D *t);
 Tensor3D tensor_create(int batch_size, int seq_len, int d_model);
@@ -160,6 +193,9 @@ void tensor_softmax(Tensor3D *t, int axis);
 void tensor_layer_norm(Tensor3D *x, Matrix *gamma, Matrix *beta, float eps);
 void tensor_dropout(Tensor3D *t, float dropout_prob, int training);
 void matrix_dropout(Matrix *m, int rows, int cols, float dropout_prob, int training);
+void matrix_zero(Matrix *m);
+void matrix_rand(Matrix *m);
+void matrix_xavier(Matrix *m);
 
 MultiHeadAttention *multi_head_attn_create(int nhead, int d_model, float dropout);
 void multi_head_attn_free(MultiHeadAttention *attn);
@@ -168,12 +204,13 @@ Tensor3D multi_head_attn_forward(
     Tensor3D *query,
     Tensor3D *key,
     Tensor3D *value,
-    Tensor3D *attn_mask
+    Tensor3D *attn_mask,
+    AttnCache *cache
 );
 
 FeedForward *feed_forward_create(int d_model, int d_ff, Activation activation);
 void feed_forward_free(FeedForward *ffn);
-Tensor3D feed_forward_forward(FeedForward *ffn, Tensor3D *x);
+Tensor3D feed_forward_forward(FeedForward *ffn, Tensor3D *x, Tensor3D *hidden_cache);
 
 PositionalEncoding *positional_encoding_create(int d_model, int max_len, float dropout);
 void positional_encoding_free(PositionalEncoding *pe);
@@ -182,12 +219,10 @@ Tensor3D positional_encoding_forward(PositionalEncoding *pe, int seq_len);
 EncoderLayer encoder_layer_create(int nhead, int d_model, int d_ff, float dropout);
 void encoder_layer_free(EncoderLayer *layer);
 Tensor3D encoder_layer_forward(EncoderLayer *layer, Tensor3D *x, Tensor3D *mask, EncoderLayerCache *cache);
-void encoder_layer_backward(EncoderLayer *layer, EncoderLayerCache *cache, Tensor3D *grad_output, Tensor3D *grad_input);
 
 DecoderLayer decoder_layer_create(int nhead, int d_model, int d_ff, float dropout);
 void decoder_layer_free(DecoderLayer *layer);
 Tensor3D decoder_layer_forward(DecoderLayer *layer, Tensor3D *x, Tensor3D *encoder_out, Tensor3D *src_mask, Tensor3D *tgt_mask, DecoderLayerCache *cache);
-void decoder_layer_backward(DecoderLayer *layer, DecoderLayerCache *cache, Tensor3D *grad_output, Tensor3D *grad_input);
 
 Encoder *encoder_create(int num_layers, int nhead, int d_model, int d_ff, int max_len, float dropout);
 void encoder_free(Encoder *enc);
@@ -200,31 +235,21 @@ Tensor3D decoder_forward(Decoder *dec, Tensor3D *tgt, Tensor3D *encoder_out, Ten
 Transformer *transformer_create(TransformerConfig *config);
 void transformer_free(Transformer *t);
 Tensor3D transformer_forward(Transformer *t, Tensor3D *src, Tensor3D *tgt, Tensor3D *src_mask, Tensor3D *tgt_mask, TransformerCache *cache);
-void transformer_backward(Transformer *t, TransformerCache *cache, Tensor3D *grad, Tensor3D *tgt);
+void transformer_backward(Transformer *t, TransformerCache *cache, Tensor3D *grad, Tensor3D *tgt, TrainingState *ts);
+void transformer_cache_free(TransformerCache *cache, int encoder_layers, int decoder_layers);
 
 void tensor_print(Tensor3D *t, const char *name);
-
-// Training functions
-typedef struct {
-    float learning_rate;
-    float beta1;
-    float beta2;
-    float eps;
-    int t;
-} AdamOptimizer;
 
 AdamOptimizer adam_create(float lr, float beta1, float beta2, float eps);
 void adam_update_matrix(Matrix *m, Matrix *grad, Matrix *m_moment, Matrix *v_moment, AdamOptimizer *opt);
 void adam_update_tensor(Tensor3D *t, Tensor3D *grad, Tensor3D *m_moment, Tensor3D *v_moment, AdamOptimizer *opt);
 
-// Backward functions
 void tensor_softmax_backward(Tensor3D *output, Tensor3D *grad_output, Tensor3D *grad_input, int axis);
-void tensor_layer_norm_backward(Tensor3D *x, Tensor3D *grad_output, Matrix *gamma, Matrix *beta, Tensor3D *grad_input, float eps);
+void tensor_layer_norm_backward(Tensor3D *x, Tensor3D *grad_output, Matrix *gamma, Matrix *beta, Tensor3D *grad_input, float eps, Matrix *grad_gamma, Matrix *grad_beta);
 void mat_vec_mul_backward(Matrix *w, float *in, float *grad_out, int batch, int seq, int d_in, int d_out, Matrix *grad_w, float *grad_in);
-void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3D *key, Tensor3D *value, Tensor3D *attn_mask_unused, Tensor3D *grad_output, Tensor3D *grad_query, Tensor3D *grad_key, Tensor3D *grad_value);
-void feed_forward_backward(FeedForward *ffn, Tensor3D *x, Tensor3D *grad_output, Tensor3D *grad_input);
+void multi_head_attn_backward(MultiHeadAttention *attn, Tensor3D *query, Tensor3D *key, Tensor3D *value, Tensor3D *attn_mask_unused, Tensor3D *grad_output, Tensor3D *grad_query, Tensor3D *grad_key, Tensor3D *grad_value, AttnCache *attn_cache, TrainingState *ts);
+void feed_forward_backward(FeedForward *ffn, Tensor3D *x, Tensor3D *grad_output, Tensor3D *grad_input, Tensor3D *hidden_cache, TrainingState *ts);
 
-// Loss functions
 typedef struct {
     float loss;
     Tensor3D grad;
@@ -234,10 +259,16 @@ LossResult cross_entropy_loss(Tensor3D *pred, int *targets, int vocab_size);
 LossResult mse_loss(Tensor3D *pred, Tensor3D *target);
 void loss_print(LossResult *loss, const char *name);
 
-// Training
+TrainingState *training_state_create(Transformer *model, float lr, float beta1, float beta2, float eps);
+void training_state_free(TrainingState *ts);
+void training_state_zero_grads(TrainingState *ts);
+void training_state_update(TrainingState *ts);
+void training_state_clip_grads(TrainingState *ts, float max_norm);
+Matrix *find_grad(TrainingState *ts, Matrix *param);
+
 typedef struct {
     Transformer *model;
-    AdamOptimizer optimizer;
+    TrainingState *ts;
     float learning_rate;
 } Trainer;
 

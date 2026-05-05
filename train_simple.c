@@ -9,9 +9,8 @@
 
 int main() {
     srand(time(NULL));
-    printf("=== 简单训练测试 ===\n\n");
-    
-    // 创建模型
+    printf("=== Simple Training Test ===\n\n");
+
     TransformerConfig config = {
         .d_model = D_MODEL,
         .nhead = 2,
@@ -19,60 +18,56 @@ int main() {
         .encoder_layers = 1,
         .decoder_layers = 1,
         .max_len = 10,
-        .dropout = 0.0,  // 训练时关闭dropout
+        .dropout = 0.0,
         .activation = GELU
     };
-    
+
     Transformer *model = transformer_create(&config);
-    Trainer trainer = trainer_create(model, 0.01f, 0.9f, 0.999f, 1e-8f);
-    
-    // 创建数据
+    TrainingState *ts = training_state_create(model, 0.01f, 0.9f, 0.999f, 1e-8f);
+
     Tensor3D src = tensor_create(1, SEQ_LEN, D_MODEL);
     Tensor3D tgt = tensor_create(1, SEQ_LEN, D_MODEL);
-    int targets[SEQ_LEN] = {1, 3, 5, 7};  // 固定目标
-    
-    // 初始化输入（用targets作为源）
+    int targets[SEQ_LEN] = {1, 3, 5, 7};
+
     for (int s = 0; s < SEQ_LEN; s++) {
         for (int d = 0; d < D_MODEL; d++) {
             src.data[s * D_MODEL + d] = (float)targets[s] / VOCAB_SIZE;
             tgt.data[s * D_MODEL + d] = (float)targets[s] / VOCAB_SIZE;
         }
     }
-    
-    printf("开始训练（复制任务）...\n");
-    printf("初始数据: ");
+
+    printf("Starting training (copy task)...\n");
+    printf("Targets: ");
     for (int s = 0; s < SEQ_LEN; s++) printf("%d ", targets[s]);
     printf("\n\n");
-    
-    // 训练10轮
+
     for (int epoch = 0; epoch < 10; epoch++) {
-        // Forward
+        training_state_zero_grads(ts);
+
         TransformerCache cache = {0};
         Tensor3D output = transformer_forward(model, &src, &tgt, NULL, NULL, &cache);
-        
-        // Loss
+
         LossResult loss = cross_entropy_loss(&output, targets, VOCAB_SIZE);
-        
-        // Backward（简化版，只更新输出层）
-        transformer_backward(model, &cache, &loss.grad, &tgt);
-        
-        // 清理缓存 - 简化版
-        tensor_free(&loss.grad);
+
+        transformer_backward(model, &cache, &loss.grad, &tgt, ts);
+        training_state_update(ts);
+
+        transformer_cache_free(&cache, config.encoder_layers, config.decoder_layers);
         tensor_free(&output);
-        
+        tensor_free(&loss.grad);
+
         printf("Epoch %d: loss = %.4f\n", epoch, loss.loss);
-        
+
         if (loss.loss < 0.01f) {
-            printf("损失足够低，提前停止\n");
+            printf("Loss low enough, stopping early\n");
             break;
         }
     }
-    
-    printf("\n训练完成！\n");
-    
-    // 测试
+
+    printf("\nTraining complete!\n");
+
     Tensor3D test_output = transformer_forward(model, &src, &tgt, NULL, NULL, NULL);
-    printf("预测结果（取argmax）: ");
+    printf("Predictions (argmax): ");
     for (int s = 0; s < SEQ_LEN; s++) {
         int offset = s * D_MODEL;
         int best = 0;
@@ -84,12 +79,12 @@ int main() {
         printf("%d ", best);
     }
     printf("\n");
-    
+
     tensor_free(&test_output);
     tensor_free(&src);
     tensor_free(&tgt);
-    trainer_free(&trainer);
+    training_state_free(ts);
     transformer_free(model);
-    
+
     return 0;
 }

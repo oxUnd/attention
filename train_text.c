@@ -183,7 +183,7 @@ int main(void) {
     };
 
     Transformer *model = transformer_create(&config);
-    Trainer trainer = trainer_create(model, 0.001f, 0.9f, 0.999f, 1e-8f);
+    TrainingState *ts = training_state_create(model, 0.001f, 0.9f, 0.999f, 1e-8f);
 
     Tensor3D src = tensor_create(BATCH_SIZE, SEQ_LEN, D_MODEL);
     Tensor3D tgt = tensor_create(BATCH_SIZE, SEQ_LEN, D_MODEL);
@@ -195,6 +195,8 @@ int main(void) {
     for (int epoch = 0; epoch < NUM_EPOCHS; epoch++) {
         generate_text_batch(&src, &tgt, targets);
 
+        training_state_zero_grads(ts);
+
         TransformerCache cache = {0};
         Tensor3D output = transformer_forward(model, &src, &tgt, NULL, NULL, &cache);
 
@@ -205,8 +207,11 @@ int main(void) {
             printf("Epoch %d: loss=%.4f, acc=%.1f%%\n", epoch, loss.loss, acc);
         }
 
-        transformer_backward(model, &cache, &loss.grad, &tgt);
+        transformer_backward(model, &cache, &loss.grad, &tgt, ts);
+        training_state_clip_grads(ts, 1.0f);
+        training_state_update(ts);
 
+        transformer_cache_free(&cache, config.encoder_layers, config.decoder_layers);
         tensor_free(&output);
         tensor_free(&loss.grad);
 
@@ -239,7 +244,7 @@ int main(void) {
 
     tensor_free(&src);
     tensor_free(&tgt);
-    trainer_free(&trainer);
+    training_state_free(ts);
     transformer_free(model);
 
     return 0;
