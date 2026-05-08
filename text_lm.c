@@ -13,7 +13,7 @@ const TextLmHyperparams text_lm_default_hyperparams = {
     .batch_size = 8,
     .d_model = 64,
     .d_ff = 128,
-    .nhead = 4,
+    .num_heads = 4,
     .encoder_layers = 1,
     .decoder_layers = 1,
     .max_epochs = 80,
@@ -186,7 +186,7 @@ static int run_one_step(Transformer *model, const int *context, int ctx_len, int
             tgt.data[s * d_model + ci] = 1.0f;
         }
     }
-    Tensor3D mask = causal_mask_create(ctx_len);
+    Tensor3D mask = mask_causal_create(ctx_len);
     Tensor3D output = transformer_forward(model, &src, &tgt, &mask, &mask, NULL);
     int vsize = (vocab_size > 0 && vocab_size <= d_model) ? vocab_size : d_model;
     int pred = sample_logits(&output.data[(ctx_len - 1) * d_model], vsize, temperature);
@@ -303,13 +303,13 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
     int num_batches = n_starts / batch_size;
 
     TransformerConfig config = {.d_model = hp->d_model,
-                                .nhead = hp->nhead,
+                                .num_heads = hp->num_heads,
                                 .d_ff = hp->d_ff,
                                 .encoder_layers = hp->encoder_layers,
                                 .decoder_layers = hp->decoder_layers,
                                 .max_len = seq_len + 5,
                                 .dropout = hp->dropout,
-                                .activation = GELU};
+                                .activation = ACT_GELU};
 
     Transformer *model = transformer_create(&config);
     TrainingState *ts = training_state_create(model, hp->learning_rate, 0.9f, 0.999f, 1e-8f);
@@ -322,7 +322,7 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
 
     Tensor3D src = tensor_create(batch_size, seq_len, hp->d_model);
     Tensor3D tgt = tensor_create(batch_size, seq_len, hp->d_model);
-    Tensor3D causal = causal_mask_create(seq_len);
+    Tensor3D causal = mask_causal_create(seq_len);
     int *targets = (int *)malloc((size_t)(batch_size * seq_len) * sizeof(int));
     if (!targets) {
         tensor_free(&src);

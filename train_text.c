@@ -36,7 +36,7 @@ static int eval_held_out(Transformer *model, const TextLmHyperparams *hp, const 
 
     Tensor3D src = tensor_create(1, seq_len, d_model);
     Tensor3D tgt = tensor_create(1, seq_len, d_model);
-    Tensor3D mask = causal_mask_create(seq_len);
+    Tensor3D mask = mask_causal_create(seq_len);
     int *targets = (int *)malloc((size_t)seq_len * sizeof(int));
 
     float sum_loss = 0.0f;
@@ -101,7 +101,7 @@ static void run_word_demo(void) {
     TextLmHyperparams hp = text_lm_default_hyperparams;
     hp.d_model = 64;
     hp.d_ff = 128;
-    hp.nhead = 4;
+    hp.num_heads = 4;
     hp.encoder_layers = 1;
     hp.decoder_layers = 1;
     hp.seq_len = 8;
@@ -142,7 +142,7 @@ static void run_char_demo(void) {
     TextLmHyperparams hp = text_lm_default_hyperparams;
     hp.d_model = 64;
     hp.d_ff = 128;
-    hp.nhead = 4;
+    hp.num_heads = 4;
     hp.encoder_layers = 1;
     hp.decoder_layers = 1;
     hp.seq_len = 16;

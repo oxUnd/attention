@@ -54,13 +54,13 @@ int main() {
 
     TransformerConfig config = {
         .d_model = D_MODEL,
-        .nhead = 2,
+        .num_heads = 2,
         .d_ff = 32,
         .encoder_layers = 2,
         .decoder_layers = 2,
         .max_len = SEQ_LEN + 10,
         .dropout = 0.0,
-        .activation = GELU
+        .activation = ACT_GELU
     };
 
     Transformer *model = transformer_create(&config);

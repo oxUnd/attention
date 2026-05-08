@@ -21,13 +21,13 @@ int main() {
     printf("Testing trainer...\n");
     TransformerConfig config = {
         .d_model = 16,
-        .nhead = 2,
+        .num_heads = 2,
         .d_ff = 32,
         .encoder_layers = 1,
         .decoder_layers = 1,
         .max_len = 10,
         .dropout = 0.1,
-        .activation = GELU
+        .activation = ACT_GELU
     };
     
     Transformer *model = transformer_create(&config);

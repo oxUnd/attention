@@ -17,7 +17,7 @@ typedef struct {
     int batch_size;
     int d_model;
     int d_ff;
-    int nhead;
+    int num_heads;
     int encoder_layers;
     int decoder_layers;
     int max_epochs;

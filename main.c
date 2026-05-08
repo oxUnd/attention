@@ -26,7 +26,7 @@ static void hyperparams_from_model(const Transformer *m, TextLmHyperparams *hp) 
     *hp = text_lm_default_hyperparams;
     hp->d_model = m->config.d_model;
     hp->d_ff = m->config.d_ff;
-    hp->nhead = m->config.nhead;
+    hp->num_heads = m->config.num_heads;
     hp->encoder_layers = m->config.encoder_layers;
     hp->decoder_layers = m->config.decoder_layers;
     hp->dropout = (float)m->config.dropout;
@@ -205,8 +205,8 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        printf("Hyperparams: seq=%d batch=%d d_model=%d d_ff=%d nhead=%d enc=%d dec=%d epochs=%d lr=%.4f\n",
-               hp.seq_len, hp.batch_size, hp.d_model, hp.d_ff, hp.nhead, hp.encoder_layers,
+        printf("Hyperparams: seq=%d batch=%d d_model=%d d_ff=%d heads=%d enc=%d dec=%d epochs=%d lr=%.4f\n",
+               hp.seq_len, hp.batch_size, hp.d_model, hp.d_ff, hp.num_heads, hp.encoder_layers,
                hp.decoder_layers, hp.max_epochs, hp.learning_rate);
         printf("Corpus tokens: %d (from %zu raw bytes)\n\n", corpus.len, raw_len);
 

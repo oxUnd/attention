@@ -1,10 +1,11 @@
 # attention
 
-纯 C 实现的 **Transformer**（Encoder–Decoder、多头注意力、前馈与训练循环），附带可插拔的 **Tokenizer** 模块、**Causal Mask** 支持、字符/词级语言模型与若干小型训练演示。
+纯 C 实现的 **Transformer**（Encoder–Decoder、多头注意力、前馈与训练循环），附带可插拔的 **Tokenizer** 模块、**Causal Mask** 支持、字符/词级语言模型与若干小型训练演示。底层数学算子已抽离到独立的 `nn_math.h/.c`，便于复用。
 
 ## 目录
 
 - [快速开始](#快速开始)
+- [代码结构](#代码结构)
 - [可执行文件](#可执行文件)
 - [Tokenizer 能力](#tokenizer-能力)
 - [字符 / 词级语言模型 CLI](#字符--词级语言模型-cli)
@@ -24,6 +25,26 @@ make clean      # 清理产物
 ```
 
 依赖：C99 编译器（GCC/Clang），数学库 `-lm`。
+
+## 代码结构
+
+```
+nn_math.{h,c}      Tensor3D / Matrix 数据结构、激活、Linear、Softmax、LayerNorm、
+                   Dropout、Adam、Cross-Entropy / MSE Loss、causal/padding mask 等
+                   底层数学原语（与具体模型解耦，方便复用）
+transformer.{h,c}  MultiHeadAttention / FeedForward / PositionalEncoding /
+                   Encoder / Decoder / Transformer 的前向反向、TrainingState /
+                   Trainer 高层封装、checkpoint I/O
+tokenizer.{h,c}    char / byte / word 三种分词器 + 特殊符号 + 词表持久化
+text_lm.{h,c}      文本语言模型训练循环、采样生成（含 tokenizer 接入）
+main.c             带参 CLI（训练 / 加载 / 续写）
+train_*.c          各种独立训练演示
+```
+
+`transformer.{h,c}` 里的字段命名遵循当前主流框架习惯：`num_heads`、`head_dim`、
+`Wq`/`Wk`/`Wv`/`Wo`（attention 投影矩阵）、`W1`/`b1`/`W2`/`b2`（FFN）、
+`ln{1,2,3}_{gamma,beta}`（LayerNorm 参数）、`activation`（`ActivationKind` 枚举）。
+原先的 `nhead`/`d_k`/`wq`/`GELU` 等旧名一律被替换。
 
 ## 可执行文件
 
@@ -147,27 +168,31 @@ max_token_len 6
 | 改动 | 文件 | 说明 |
 |------|------|------|
 | 新增 Tokenizer 模块 | `tokenizer.h/.c` | char/byte/word 三种分词器 + 特殊符号 + save/load |
-| Causal mask 支持 | `transformer.h/.c` | `causal_mask_create`、`padding_mask_create`，注意力中按形状自动识别 `[*, S, S]` 的 query-key mask 与 `[*, 1, S]` 的 padding mask |
-| 接入 tokenizer 的 LM 训练/生成 | `text_lm.h/.c` | `text_corpus_from_text_with_tokenizer`、`text_lm_generate_with_tokenizer`；训练时同时把 causal mask 传给 encoder self-attn / decoder self-attn / cross-attn，杜绝原本的未来信息泄漏 |
+| 抽离底层数学算子 | `nn_math.h/.c` | Tensor/Matrix、激活、Linear、Softmax、LayerNorm、Dropout、Adam、Loss、Mask 工具，全部用更可读的命名（`tensor_softmax_inplace`、`linear_forward/backward`、`adam_apply_matrix` 等）。`transformer.{h,c}` 仅依赖 `nn_math.h`，专注于模型组件本身 |
+| 重构 transformer | `transformer.{h,c}` | `nhead → num_heads`，`d_k → head_dim`，`wq/wk/wv/wq_out → Wq/Wk/Wv/Wo`，`w1/b1/w2/b2 → W1/b1/W2/b2`，`pe → table`，`Activation → ActivationKind`，去掉 `FeedForward` 中冗余的 `gamma/beta/eps` 字段，attention/encoder/decoder 内部拆出 `split_heads`/`merge_heads`/`apply_attn_mask`/`attention_softmax_inplace` 等小函数 |
+| Causal mask 支持 | `nn_math.h/.c`、`transformer.c` | `mask_causal_create`、`mask_padding_create`，注意力中按形状自动识别 `[*, S, S]` 的 query-key mask 与 `[*, 1, S]` 的 padding mask |
+| Adam 一步即一次 | `nn_math.h/.c`、`transformer.c` | 拆出 `adam_corrected_lr` + `adam_apply_matrix`，由 `training_state_update` 统一负责 `step` 自增，避免每个参数都重复推进时间步 |
+| 接入 tokenizer 的 LM 训练/生成 | `text_lm.{h,c}` | `text_corpus_from_text_with_tokenizer`、`text_lm_generate_with_tokenizer`；训练时同时把 causal mask 传给 encoder self-attn / decoder self-attn / cross-attn，杜绝原本的未来信息泄漏 |
 | 主 CLI 重构 | `main.c` | `--tokenizer char/word/byte`、`--vocab-size`、`--d-model`、`--layers`、`--seq-len`、`--batch`、`--epochs`、`--lr`，模型与词表配对保存/加载 |
 | 重写文本 demo | `train_text.c` | 精简、可重复的词级/字符级双 demo + held-out 评估 |
-| Makefile 与文档 | `Makefile`, `README.md` | 新增 `make text`，并整理用法 |
+| Makefile 与文档 | `Makefile`, `README.md` | 编译加入 `nn_math.o`，依赖关系更新；新增 `make text` 等目标 |
 
-向后兼容：`train_full` / `train_copy_task` / `train_simple` 不依赖新接口（原本就用 `NULL` mask），编译与运行均不受影响。
+向后兼容：`train_full` / `train_copy_task` / `train_simple` 已同步迁移到新命名（`num_heads`、`ACT_GELU`），运行结果不变。
 
 ### 评估示例输出
 
 ```text
-Tokenizer{kind=word, vocab=17, max_token_len=6, lowercase=1}
-Corpus tokens: 217
-Windows per epoch: 208 (13 gradient steps), max epochs: 60, vocab: 17
-Epoch    0: avg_loss=2.5389 avg_acc=16.2%
-Epoch    2: avg_loss=2.3613 avg_acc=21.2%
-...
-Held-out eval (32 windows): loss=2.3691 acc=18.4%
+Epoch    0: avg_loss=2.0325 avg_acc=38.3%
+Epoch    9: avg_loss=0.3620 avg_acc=83.5%
+Epoch   29: avg_loss=0.3052 avg_acc=85.5%
+Held-out eval (32 windows): loss=0.2952 acc=86.3%
+
+--- Char-level samples (T=0.4) ---
+Seed: "the cat "
+Generated: the cat is happy. the bird is sad. the cat sees the dog. ...
 ```
 
-模型规模（d_model=64、单层 enc/dec）和小语料的搭配下，词级 LM 大约能学到一阶/二阶词频统计；字符级 LM 在 ~30 epoch 内可以从 log(28)≈3.33 降到 ~2.35 损失（约 28% top-1）。这是当前框架的工程上限——若需要进一步提升，建议：
+模型规模（d_model=64、单层 enc/dec）和小语料的搭配下，词级 LM 大约能学到一阶/二阶词频统计；字符级 LM 在 ~30 epoch 内能把损失从 log(28)≈3.33 降到 ~0.30（≈86% top-1）。这是当前框架的工程上限——若需要进一步提升，建议：
 
 - 改成 **Pre-LayerNorm**（最大收益）；
 - 引入 **KV cache** 加速生成；
