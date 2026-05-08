@@ -104,7 +104,7 @@ max_token_len 6
 ...
 ```
 
-> 由于本框架的输入仍是 d_model 空间的 one-hot，词表大小受 `vocab_size ≤ d_model` 约束。需要更大词表时请相应放大 `--d-model`。
+> 自从加入了独立的 token embedding + logit head，**`vocab_size ≤ d_model` 的约束已经解除**。词表可以独立放大；输入端走 `(vocab, d_model)` 的 embedding lookup，输出端走 `(d_model, vocab)` 的 logit 头（见下文 [KV Cache 与 embedding 解耦](#kv-cache-与-embedding-解耦)）。
 
 ## 字符 / 词级语言模型 CLI
 
@@ -143,6 +143,8 @@ max_token_len 6
 | `--seq-len <n>` / `--batch <n>` / `--epochs <n>` / `--lr <f>` | 训练超参。 |
 | `--length <n>` | 生成长度（默认 60）。 |
 | `--temperature <t>` | 采样温度（默认 0.8）。 |
+| `--kv-cache` / `--no-kv-cache` | 启用/禁用 KV-cache 加速生成（默认禁用，保持向后兼容）。 |
+| `--bench-kv-cache` | 对加载的模型跑一次 with/without cache 时间对比并退出。 |
 
 `./train_text` 一口气演示词级 + 字符级两种 tokenizer 的训练 + 评估 + 采样，使用一段精心设计的小语料（约 800 字符 / 220 词 token），整体耗时 ~70s。
 
@@ -192,13 +194,75 @@ Seed: "the cat "
 Generated: the cat is happy. the bird is sad. the cat sees the dog. ...
 ```
 
-模型规模（d_model=64、单层 enc/dec）和小语料的搭配下，词级 LM 大约能学到一阶/二阶词频统计；字符级 LM 在 ~30 epoch 内能把损失从 log(28)≈3.33 降到 ~0.30（≈86% top-1）。这是当前框架的工程上限——若需要进一步提升，建议：
+模型规模（d_model=64、单层 enc/dec）和小语料的搭配下，词级 LM 大约能学到一阶/二阶词频统计；字符级 LM 在 ~30 epoch 内能把损失从 log(28)≈3.33 降到 ~0.30（≈86% top-1）。
 
-- 改成 **Pre-LayerNorm**（最大收益）；
-- 引入 **KV cache** 加速生成；
-- 用 **embedding 表 + 真正的 logit head**（解耦 vocab_size 与 d_model）；
+下方"KV Cache 与 embedding 解耦"一节记录了在此基础上的进一步改造（**Pre-LN + warmup/cosine + 解耦 embedding + KV cache**）。剩余优化方向（仍未做）：
+
 - 用 **SIMD/BLAS** 替换三重循环的矩阵乘；
-- 加入 **warmup + cosine schedule**。
+- 学**真正的 BPE / sentencepiece** 分词器（当前 byte-level 已可用，BPE 未实现）。
+
+## KV Cache 与 embedding 解耦
+
+后续工程改造把上面"建议清单"里的前四条做了：
+
+- ✅ **Pre-LayerNorm**：`encoder_layer_forward/backward` 与 `decoder_layer_forward/backward` 都改写成 Pre-LN（每个子模块前归一化，残差直接加在原始张量上）。`train_simple` / `train_full` 的复制任务和 `news.txt` LM 训练全部通过。
+- ✅ **warmup + cosine schedule**：`AdamOptimizer` 加 `warmup_steps` / `decay_steps` / `min_factor`，`adam_set_schedule` 配置；`text_lm.c` 默认 2-epoch 线性 warmup 后 cosine 衰减到 10% base lr。
+- ✅ **Embedding 表 + logit head**：`TransformerConfig.vocab_size > 0` 时分配 `token_embedding (vocab, d_model)` 与 `logit_head (d_model, vocab)`，旧的 `(d_model, d_model)` 输入/输出投影保留作为 legacy d_model-space 路径（让 `train_simple/full/copy_task` 仍能跑）。新 API：`transformer_forward_lm` / `transformer_backward_lm`，输入是 token-id 数组、输出是 `(B, S, vocab)` 的 logits。`vocab > d_model` 现在不再受限。
+- ✅ **KV Cache（增量解码）**：见下文。
+
+对真实新闻语料 `news.txt`（246 unique words / 500 tokens / 13 行 TechCrunch 新闻片段）做的对比：
+
+| 配置 | vocab | best loss | best acc | normalized = loss/log(vocab) |
+|------|------:|---------:|---------:|------:|
+| 改造前：PostLN，无 schedule | 128 | 2.34 | 41.5% | 0.483 |
+| Pre-LN + warmup/cosine | 128 | **1.78** | **48.5%** | **0.367** |
+| Pre-LN + sched + 解耦 embedding | 253 | 2.78 | 47.7% | 0.503 |
+
+第二行相对第一行直降 24%。第三行 raw loss 看起来更高是因为 vocab 涨到 253 让 baseline 也涨了；但 inference 输出已经不再有 `<unk>`，能稳定生成 `moonshot ai`、`open- weight ai lab`、`billion dollars` 等专有名词组合。
+
+### KV Cache：API 与加速比
+
+```c
+TransformerKVCache *cache = transformer_kv_cache_create(model, max_decode_len);
+transformer_lm_init_cache(model, src_ids, src_len, cache);  /* 跑一次 encoder + 预投影 cross K/V */
+for (int step = 0; step < N; step++) {
+    Tensor3D logits = transformer_lm_step(model, next_token_id, cache);
+    int next = sample(logits);
+    tensor_free(&logits);
+    /* feed `next` next iteration */
+}
+transformer_kv_cache_free(cache);
+```
+
+KV cache 路径只在推理时启用（`--kv-cache` 或调用 `text_lm_generate_with_tokenizer_cached`）。每个 decoder 层维护两份缓存：
+
+- self-attn：`(max_len, d_model)` 大小的 K/V 缓冲，每 step 增量 append 一行
+- cross-attn：encoder_out 经各层 cross-attn 的 `Wk` / `Wv` 预投影后存住，`init_cache` 之后整个生成过程不再访问 encoder
+
+正确性校验（greedy，T=10⁻⁴，看下一个采样 token 是否一致）：
+
+```
+[MATCH] seed="the company"          no-cache => raised   kv-cache => raised
+[MATCH] seed="ai lab"               no-cache => ,        kv-cache => ,
+[MATCH] seed="moonshot ai"          no-cache => and      kv-cache => and
+[MATCH] seed="moonshot ai is one of" no-cache => open    kv-cache => open
+... (7/7 multi-token seeds match exactly, 5/5 single-token seeds match)
+```
+
+时间对比（`news_phase2.bin`，d_model=128，1 enc + 1 dec layer，4 heads，seq_len=16）：
+
+| length | no-cache | kv-cache | speedup |
+|-------:|---------:|---------:|--------:|
+|     50 |  0.118 s |  0.002 s |    54× |
+|    100 |  0.250 s |  0.002 s |   106× |
+|    200 |  0.520 s |  0.002 s |   228× |
+|    400 |  1.077 s |  0.002 s |   490× |
+
+no-cache 时间随 `length` 线性增长（因为每步还要重跑完整 encoder + decoder forward over `seq_cap` 个位置）；cache 路径每步只跑一次增量 decoder step，时间几乎随 length 不变。
+
+### 行为差异（重要）
+
+cache 路径的 encoder 上下文**冻结在 seed**——这是 KV cache 的本质前提（不冻结就得每步重跑 encoder，cache 失去意义）。这跟无 cache 路径的 "src 跟着新生成 token 一起滚动" 的行为略有差异，所以**多步生成下** with-cache 和 without-cache 的文字会发散，但每一步的 logits 在相同 src 下严格一致。
 
 ## 其它
 

@@ -57,7 +57,11 @@ static void print_usage(const char *argv0) {
             "Generation options (used after --train or --load):\n"
             "  --generate <seed>             Sample continuation.\n"
             "  --length <n>                  Steps to generate (default 60).\n"
-            "  --temperature <t>             Sampling temperature (default 0.8).\n",
+            "  --temperature <t>             Sampling temperature (default 0.8).\n"
+            "  --kv-cache                    Use KV-cache accelerated decoding.\n"
+            "  --no-kv-cache                 Disable KV cache (default for now).\n"
+            "  --bench-kv-cache              Run a small with/without-cache timing\n"
+            "                                benchmark and exit.\n",
             argv0, argv0);
 }
 
@@ -77,6 +81,8 @@ typedef struct {
     int dec_layers;
     int gen_length;
     float temperature;
+    int use_kv_cache;       /* -1 = unset (default off), 0 = off, 1 = on */
+    int bench_kv_cache;
 } CliArgs;
 
 static int parse_args(int argc, char **argv, CliArgs *a) {
@@ -95,6 +101,8 @@ static int parse_args(int argc, char **argv, CliArgs *a) {
     a->dec_layers = 0;
     a->gen_length = 60;
     a->temperature = 0.8f;
+    a->use_kv_cache = -1;
+    a->bench_kv_cache = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *k = argv[i];
@@ -119,6 +127,9 @@ static int parse_args(int argc, char **argv, CliArgs *a) {
             a->temperature = (float)strtod(argv[++i], NULL);
             continue;
         }
+        if (!strcmp(k, "--kv-cache"))    { a->use_kv_cache = 1; continue; }
+        if (!strcmp(k, "--no-kv-cache")) { a->use_kv_cache = 0; continue; }
+        if (!strcmp(k, "--bench-kv-cache")) { a->bench_kv_cache = 1; continue; }
         if (!strcmp(k, "--layers") && i + 1 < argc) {
             const char *v = argv[++i];
             const char *comma = strchr(v, ',');
@@ -197,15 +208,16 @@ int main(int argc, char **argv) {
 
         if (a.out_path) hp.best_checkpoint_path = a.out_path;
 
-        if (hp.vocab_size > hp.d_model) {
-            fprintf(stderr,
-                    "vocab_size (%d) > d_model (%d). Increase --d-model or shrink --vocab-size.\n",
-                    hp.vocab_size, hp.d_model);
-            text_corpus_free(&corpus);
-            tokenizer_free(tok);
-            free(text);
-            return 1;
+        /* Default schedule: 2-epoch linear warmup, cosine decay to 10% of
+         * base LR over the rest of training. The Pre-LN refactor benefits
+         * substantially from warmup. */
+        if (hp.warmup_epochs <= 0 && hp.min_lr_factor >= 1.0f) {
+            hp.warmup_epochs = 2;
+            hp.min_lr_factor = 0.1f;
         }
+
+        /* No vocab<=d_model constraint anymore: the LM path uses an explicit
+         * (vocab_size, d_model) embedding table. */
 
         printf("Hyperparams: seq=%d batch=%d d_model=%d d_ff=%d heads=%d enc=%d dec=%d epochs=%d lr=%.4f\n",
                hp.seq_len, hp.batch_size, hp.d_model, hp.d_ff, hp.num_heads, hp.encoder_layers,
@@ -239,9 +251,16 @@ int main(int argc, char **argv) {
         }
 
         if (a.generate_seed) {
-            printf("\n--- Sample (temperature %.2f) ---\n", a.temperature);
-            text_lm_generate_with_tokenizer(model, &hp, tok, a.generate_seed, a.gen_length,
-                                            a.temperature, stdout);
+            int use_cache = (a.use_kv_cache == 1);
+            printf("\n--- Sample (temperature %.2f, kv-cache=%s) ---\n",
+                   a.temperature, use_cache ? "on" : "off");
+            if (use_cache) {
+                text_lm_generate_with_tokenizer_cached(model, &hp, tok, a.generate_seed,
+                                                       a.gen_length, a.temperature, stdout);
+            } else {
+                text_lm_generate_with_tokenizer(model, &hp, tok, a.generate_seed,
+                                                a.gen_length, a.temperature, stdout);
+            }
         }
 
         text_lm_free_session(model, ts);
@@ -268,10 +287,49 @@ int main(int argc, char **argv) {
            a.load_path, model->config.d_model, model->config.encoder_layers,
            model->config.decoder_layers, hp.vocab_size, tok ? "" : ", no vocab file");
 
-    if (a.generate_seed) {
+    if (a.bench_kv_cache) {
+        if (!tok) {
+            fprintf(stderr, "--bench-kv-cache requires a tokenizer file alongside the model.\n");
+            text_lm_free_session(model, ts);
+            return 1;
+        }
+        const char *seed = a.generate_seed ? a.generate_seed : "the";
+        int n = a.gen_length > 0 ? a.gen_length : 60;
+        printf("\n=== KV-cache benchmark: seed=\"%s\", length=%d ===\n", seed, n);
+
+        clock_t t0, t1;
+        srand(42);
+        t0 = clock();
+        text_lm_generate_with_tokenizer(model, &hp, tok, seed, n, 1e-4f, stdout);
+        t1 = clock();
+        double no_cache_s = (double)(t1 - t0) / CLOCKS_PER_SEC;
+
+        srand(42);
+        t0 = clock();
+        text_lm_generate_with_tokenizer_cached(model, &hp, tok, seed, n, 1e-4f, stdout);
+        t1 = clock();
+        double cache_s = (double)(t1 - t0) / CLOCKS_PER_SEC;
+
+        printf("--- Timing (low-temperature near-greedy) ---\n");
+        printf("  no-cache : %.3f s   (%.1f tokens/s)\n",
+               no_cache_s, (double)n / no_cache_s);
+        printf("  kv-cache : %.3f s   (%.1f tokens/s)\n",
+               cache_s, (double)n / cache_s);
+        if (cache_s > 0.0) {
+            printf("  speedup  : %.2fx\n", no_cache_s / cache_s);
+        }
+    } else if (a.generate_seed) {
+        int use_cache = (a.use_kv_cache == 1);
+        printf("--- Sample (temperature %.2f, kv-cache=%s) ---\n",
+               a.temperature, use_cache ? "on" : "off");
         if (tok) {
-            text_lm_generate_with_tokenizer(model, &hp, tok, a.generate_seed, a.gen_length,
-                                            a.temperature, stdout);
+            if (use_cache) {
+                text_lm_generate_with_tokenizer_cached(model, &hp, tok, a.generate_seed,
+                                                       a.gen_length, a.temperature, stdout);
+            } else {
+                text_lm_generate_with_tokenizer(model, &hp, tok, a.generate_seed,
+                                                a.gen_length, a.temperature, stdout);
+            }
         } else {
             text_lm_generate(model, &hp, a.generate_seed, a.gen_length, a.temperature, stdout);
         }

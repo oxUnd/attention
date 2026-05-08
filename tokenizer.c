@@ -345,6 +345,23 @@ int tokenizer_decode(const Tokenizer *t, const int *ids, int n, char *out, int m
         }
         const char *tok = t->id_to_token[id];
         if (!tok) continue;
+
+        /* Byte tokens are stored in a printable "\\xNN" form so that the
+         * vocab file stays ASCII-safe; convert them back to the raw byte
+         * value when decoding to text. */
+        if (t->kind == TOKENIZER_BYTE && id >= TOK_NUM_SPECIALS
+                && tok[0] == '\\' && tok[1] == 'x'
+                && isxdigit((unsigned char)tok[2]) && isxdigit((unsigned char)tok[3])
+                && tok[4] == '\0') {
+            unsigned int byte;
+            sscanf(tok + 2, "%2x", &byte);
+            if (pos + 1 < max_out) {
+                out[pos++] = (char)byte;
+                out[pos] = 0;
+            }
+            continue;
+        }
+
         int L = (int)strlen(tok);
         int need_space = 0;
         if (t->kind == TOKENIZER_WORD && pos > 0 && L > 0) {

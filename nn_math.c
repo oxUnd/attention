@@ -429,14 +429,53 @@ AdamOptimizer adam_create(float learning_rate, float beta1, float beta2, float e
     opt.beta2 = beta2;
     opt.eps = eps;
     opt.step = 0;
+    opt.warmup_steps = 0;
+    opt.decay_steps = 0;
+    opt.min_factor = 1.0f;
     return opt;
 }
 
+void adam_set_schedule(AdamOptimizer *opt, int warmup_steps, int decay_steps,
+                       float min_factor) {
+    if (warmup_steps < 0) warmup_steps = 0;
+    if (decay_steps < 0)  decay_steps = 0;
+    if (min_factor < 0.0f) min_factor = 0.0f;
+    if (min_factor > 1.0f) min_factor = 1.0f;
+    opt->warmup_steps = warmup_steps;
+    opt->decay_steps = decay_steps;
+    opt->min_factor = min_factor;
+}
+
+float adam_schedule_factor(const AdamOptimizer *opt) {
+    if (opt->warmup_steps <= 0 && opt->decay_steps <= 0) {
+        return 1.0f;
+    }
+    int step = opt->step;
+    if (step <= 0) {
+        return opt->warmup_steps > 0 ? 0.0f : 1.0f;
+    }
+    if (step <= opt->warmup_steps) {
+        return (float)step / (float)opt->warmup_steps;
+    }
+    if (opt->decay_steps <= 0) {
+        return 1.0f;
+    }
+    int decay_step = step - opt->warmup_steps;
+    if (decay_step >= opt->decay_steps) {
+        return opt->min_factor;
+    }
+    float t = (float)decay_step / (float)opt->decay_steps;
+    /* cosine schedule from 1.0 down to min_factor. */
+    float cos_factor = 0.5f * (1.0f + cosf((float)M_PI * t));
+    return opt->min_factor + (1.0f - opt->min_factor) * cos_factor;
+}
+
 float adam_corrected_lr(const AdamOptimizer *opt) {
-    if (opt->step <= 0) return opt->learning_rate;
-    return opt->learning_rate
-         * sqrtf(1.0f - powf(opt->beta2, (float)opt->step))
-         / (1.0f - powf(opt->beta1, (float)opt->step));
+    if (opt->step <= 0) return opt->learning_rate * adam_schedule_factor(opt);
+    float bias_corrected = opt->learning_rate
+        * sqrtf(1.0f - powf(opt->beta2, (float)opt->step))
+        / (1.0f - powf(opt->beta1, (float)opt->step));
+    return bias_corrected * adam_schedule_factor(opt);
 }
 
 void adam_apply_matrix(Matrix *param, const Matrix *grad,

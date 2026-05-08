@@ -48,6 +48,18 @@ typedef struct {
     float beta2;
     float eps;
     int step; /* 1-indexed Adam time-step counter */
+    /* Optional linear-warmup + cosine-decay schedule.  When warmup_steps == 0
+     * and decay_steps == 0 the schedule is disabled (factor == 1 always),
+     * preserving legacy behaviour.  When enabled the effective learning rate
+     * is `learning_rate * factor(step)`, where:
+     *   step <= warmup_steps :   factor = step / warmup_steps
+     *   step <= warmup+decay :   factor = 0.5 * (1 + cos(pi * t)),
+     *                            t = (step - warmup) / decay   in [0, 1]
+     *   step >  warmup+decay :   factor = min_factor
+     */
+    int warmup_steps;
+    int decay_steps;
+    float min_factor;
 } AdamOptimizer;
 
 typedef struct {
@@ -176,7 +188,16 @@ void matrix_dropout_inplace(Matrix *m, float p, int training);
 
 AdamOptimizer adam_create(float learning_rate, float beta1, float beta2, float eps);
 
-/* lr_t = lr * sqrt(1 - beta2^step) / (1 - beta1^step) */
+/* Configure linear-warmup + cosine-decay schedule. Pass warmup_steps=0 and
+ * decay_steps=0 to disable (default after adam_create). `min_factor` is the
+ * floor reached after warmup+decay steps (e.g. 0.1 for a 10x decay). */
+void adam_set_schedule(AdamOptimizer *opt, int warmup_steps, int decay_steps,
+                       float min_factor);
+
+/* Returns the schedule multiplier in [min_factor, 1] for the current step. */
+float adam_schedule_factor(const AdamOptimizer *opt);
+
+/* lr_t = lr * sqrt(1 - beta2^step) / (1 - beta1^step) * schedule_factor */
 float adam_corrected_lr(const AdamOptimizer *opt);
 
 void adam_apply_matrix(Matrix *param, const Matrix *grad,

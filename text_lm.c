@@ -22,6 +22,8 @@ const TextLmHyperparams text_lm_default_hyperparams = {
     .dropout = 0.0f,
     .vocab_size = TEXT_LM_VOCAB_SIZE,
     .best_checkpoint_path = NULL,
+    .warmup_epochs = 0,
+    .min_lr_factor = 1.0f,
 };
 
 const char *text_lm_vocab_chars(void) { return LM_CHARS; }
@@ -101,18 +103,17 @@ void text_corpus_free(TextCorpus *c) {
     }
 }
 
-static void fill_one_hot_batch(const int *corpus_idx, Tensor3D *src, Tensor3D *tgt, int *targets,
-                               int d_model, int seq_len, int batch_size, const int *starts) {
-    tensor_zero(src);
-    tensor_zero(tgt);
+/* Fill flat token-id buffers (src_ids = tgt_ids = next-token-prediction
+ * windows) and the matching targets for cross-entropy. Used by the LM
+ * training loop via transformer_forward_lm. */
+static void fill_id_batch(const int *corpus_idx, int *src_ids, int *tgt_ids,
+                          int *targets, int seq_len, int batch_size,
+                          const int *starts) {
     for (int b = 0; b < batch_size; b++) {
         int start = starts[b];
         for (int s = 0; s < seq_len; s++) {
-            int ci = corpus_idx[start + s];
-            if (ci >= 0 && ci < d_model) {
-                src->data[b * seq_len * d_model + s * d_model + ci] = 1.0f;
-                tgt->data[b * seq_len * d_model + s * d_model + ci] = 1.0f;
-            }
+            src_ids[b * seq_len + s] = corpus_idx[start + s];
+            tgt_ids[b * seq_len + s] = corpus_idx[start + s];
             targets[b * seq_len + s] = corpus_idx[start + s + 1];
         }
     }
@@ -178,6 +179,20 @@ static int sample_logits(const float *logits, int size, float temperature) {
 
 static int run_one_step(Transformer *model, const int *context, int ctx_len, int d_model,
                         int vocab_size, float temperature) {
+    Tensor3D mask = mask_causal_create(ctx_len);
+    Tensor3D output;
+    if (model->config.vocab_size > 0) {
+        /* LM path: token-id input, vocab logits output. */
+        output = transformer_forward_lm(model, context, ctx_len, context, ctx_len,
+                                        1, &mask, &mask, NULL);
+        int last_offset = (ctx_len - 1) * model->config.vocab_size;
+        int pred = sample_logits(&output.data[last_offset], model->config.vocab_size,
+                                 temperature);
+        tensor_free(&mask);
+        tensor_free(&output);
+        return pred;
+    }
+    /* Legacy d_model-space one-hot path. */
     Tensor3D src = tensor_create(1, ctx_len, d_model);
     Tensor3D tgt = tensor_create(1, ctx_len, d_model);
     for (int s = 0; s < ctx_len; s++) {
@@ -187,8 +202,7 @@ static int run_one_step(Transformer *model, const int *context, int ctx_len, int
             tgt.data[s * d_model + ci] = 1.0f;
         }
     }
-    Tensor3D mask = mask_causal_create(ctx_len);
-    Tensor3D output = transformer_forward(model, &src, &tgt, &mask, &mask, NULL);
+    output = transformer_forward(model, &src, &tgt, &mask, &mask, NULL);
     int vsize = (vocab_size > 0 && vocab_size <= d_model) ? vocab_size : d_model;
     int pred = sample_logits(&output.data[(ctx_len - 1) * d_model], vsize, temperature);
     tensor_free(&src);
@@ -276,6 +290,94 @@ void text_lm_generate_with_tokenizer(Transformer *model, const TextLmHyperparams
     free(buf);
 }
 
+void text_lm_generate_with_tokenizer_cached(Transformer *model,
+                                            const TextLmHyperparams *hp,
+                                            const Tokenizer *tok,
+                                            const char *seed, int length,
+                                            float temperature, FILE *out) {
+    if (!model || !tok || model->config.vocab_size <= 0) {
+        text_lm_generate_with_tokenizer(model, hp, tok, seed, length,
+                                        temperature, out);
+        return;
+    }
+
+    int seq_cap = hp->seq_len;
+    int buf_cap = length + 64;
+    int *buf = (int *)malloc((size_t)buf_cap * sizeof(int));
+    if (!buf) return;
+    int buf_len = 0;
+
+    if (seed && seed[0]) {
+        buf_len = tokenizer_encode(tok, seed, buf, buf_cap);
+    }
+    if (buf_len == 0) {
+        buf[buf_len++] = TOK_BOS;
+    }
+
+    char text_buf[2048];
+    tokenizer_decode(tok, buf, buf_len, text_buf, sizeof(text_buf));
+    fprintf(out, "Seed: \"%s\"\nGenerated: %s", seed ? seed : "", text_buf);
+    fflush(out);
+
+    int last_emit_len = (int)strlen(text_buf);
+
+    /* Cap encoder length at seq_cap to mimic training: training windows are
+     * sized seq_len, so feeding more would land off the positional table.
+     * If the encoded seed exceeds seq_cap, we use the last seq_cap tokens. */
+    int seed_start = (buf_len > seq_cap) ? (buf_len - seq_cap) : 0;
+    int seed_len = buf_len - seed_start;
+
+    /* The cache must accommodate every decoder position we'll write:
+     * seed primer tokens + up to `length` generated tokens. The decoder PE
+     * table is sized max_len (= seq_len + 5), so we cap at that. */
+    int dec_max = model->config.max_len;
+    if (dec_max < seed_len + length) dec_max = seed_len + length;
+
+    TransformerKVCache *cache = transformer_kv_cache_create(model, dec_max);
+    if (!cache) {
+        free(buf);
+        fprintf(out, "\n\n");
+        return;
+    }
+    transformer_lm_init_cache(model, buf + seed_start, seed_len, cache);
+
+    /* Prime the decoder with the seed so its self-attn cache contains the
+     * full prefix; we discard the logits of all but the last position. */
+    Tensor3D primed_logits = {0};
+    for (int s = 0; s < seed_len; s++) {
+        if (primed_logits.data) tensor_free(&primed_logits);
+        primed_logits = transformer_lm_step(model, buf[seed_start + s], cache);
+    }
+
+    int vocab_size = model->config.vocab_size;
+    for (int step = 0; step < length; step++) {
+        if (!primed_logits.data) break;
+        int pred = sample_logits(primed_logits.data, vocab_size, temperature);
+        tensor_free(&primed_logits);
+
+        if (pred == TOK_EOS) break;
+        if (buf_len >= buf_cap) break;
+        buf[buf_len++] = pred;
+
+        tokenizer_decode(tok, buf, buf_len, text_buf, sizeof(text_buf));
+        int new_len = (int)strlen(text_buf);
+        if (new_len > last_emit_len) {
+            fputs(text_buf + last_emit_len, out);
+            fflush(out);
+            last_emit_len = new_len;
+        }
+
+        /* Step the decoder forward with the freshly sampled token to fill
+         * its self-attn cache and produce logits for the *next* position. */
+        primed_logits = transformer_lm_step(model, pred, cache);
+    }
+    if (primed_logits.data) tensor_free(&primed_logits);
+
+    transformer_kv_cache_free(cache);
+    fprintf(out, "\n\n");
+    free(buf);
+}
+
 int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transformer **model_out,
                   TrainingState **ts_out) {
     if (!corpus || !corpus->token_ids || corpus->len <= 0 || !hp || !model_out || !ts_out) {
@@ -292,10 +394,8 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
     }
 
     int vocab_size = hp->vocab_size > 0 ? hp->vocab_size : TEXT_LM_VOCAB_SIZE;
-    if (vocab_size > hp->d_model) {
-        fprintf(stderr, "vocab_size (%d) must be <= d_model (%d)\n", vocab_size, hp->d_model);
-        return -3;
-    }
+    /* No more `vocab <= d_model` constraint: the LM forward path uses an
+     * explicit token embedding table sized (vocab_size, d_model). */
 
     int *window_order = (int *)malloc((size_t)n_starts * sizeof(int));
     if (!window_order) return -1;
@@ -310,7 +410,8 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
                                 .decoder_layers = hp->decoder_layers,
                                 .max_len = seq_len + 5,
                                 .dropout = hp->dropout,
-                                .activation = ACT_GELU};
+                                .activation = ACT_GELU,
+                                .vocab_size = vocab_size};
 
     Transformer *model = transformer_create(&config);
     TrainingState *ts = training_state_create(model, hp->learning_rate, 0.9f, 0.999f, 1e-8f);
@@ -321,13 +422,25 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
         return -1;
     }
 
-    Tensor3D src = tensor_create(batch_size, seq_len, hp->d_model);
-    Tensor3D tgt = tensor_create(batch_size, seq_len, hp->d_model);
+    /* Optional warmup + cosine decay schedule. */
+    if (hp->warmup_epochs > 0 || hp->min_lr_factor < 1.0f) {
+        int warmup_steps = hp->warmup_epochs * num_batches;
+        int decay_epochs = hp->max_epochs - hp->warmup_epochs;
+        if (decay_epochs < 0) decay_epochs = 0;
+        int decay_steps = decay_epochs * num_batches;
+        adam_set_schedule(&ts->optimizer, warmup_steps, decay_steps, hp->min_lr_factor);
+        printf("LR schedule: warmup=%d steps, cosine decay=%d steps, min_factor=%.2f\n",
+               warmup_steps, decay_steps, hp->min_lr_factor);
+    }
+
     Tensor3D causal = mask_causal_create(seq_len);
+    int *src_ids = (int *)malloc((size_t)(batch_size * seq_len) * sizeof(int));
+    int *tgt_ids = (int *)malloc((size_t)(batch_size * seq_len) * sizeof(int));
     int *targets = (int *)malloc((size_t)(batch_size * seq_len) * sizeof(int));
-    if (!targets) {
-        tensor_free(&src);
-        tensor_free(&tgt);
+    if (!src_ids || !tgt_ids || !targets) {
+        if (src_ids) free(src_ids);
+        if (tgt_ids) free(tgt_ids);
+        if (targets) free(targets);
         tensor_free(&causal);
         free(window_order);
         training_state_free(ts);
@@ -354,12 +467,16 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
                 starts[b] = window_order[base + b];
             }
 
-            fill_one_hot_batch(corpus_idx, &src, &tgt, targets, hp->d_model, seq_len, batch_size, starts);
+            fill_id_batch(corpus_idx, src_ids, tgt_ids, targets, seq_len, batch_size, starts);
 
             training_state_zero_grads(ts);
 
             TransformerCache cache = {0};
-            Tensor3D output = transformer_forward(model, &src, &tgt, &causal, &causal, &cache);
+            Tensor3D output = transformer_forward_lm(model,
+                                                     src_ids, seq_len,
+                                                     tgt_ids, seq_len,
+                                                     batch_size,
+                                                     &causal, &causal, &cache);
 
             LossResult loss = cross_entropy_loss(&output, targets, vocab_size);
             float acc = compute_accuracy(&output, targets, seq_len, batch_size, vocab_size);
@@ -367,7 +484,7 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
             sum_loss += loss.loss;
             sum_acc += acc;
 
-            transformer_backward(model, &cache, &loss.grad, &tgt, ts);
+            transformer_backward_lm(model, &cache, &loss.grad, src_ids, tgt_ids, ts);
             training_state_clip_grads(ts, 1.0f);
             training_state_update(ts);
 
@@ -405,8 +522,8 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
     }
 
     free(targets);
-    tensor_free(&src);
-    tensor_free(&tgt);
+    free(src_ids);
+    free(tgt_ids);
     tensor_free(&causal);
     free(window_order);
 

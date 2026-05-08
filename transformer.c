@@ -676,37 +676,74 @@ void encoder_layer_free(EncoderLayer *layer) {
     matrix_free(layer->ln2_beta);  free(layer->ln2_beta);
 }
 
+/* Pre-LN encoder layer:
+ *
+ *   ln1_out = LN(x; gamma1, beta1)
+ *   y1      = x + Attn(ln1_out, ln1_out, ln1_out, mask)
+ *   ln2_out = LN(y1; gamma2, beta2)
+ *   y2      = y1 + FFN(ln2_out)
+ *
+ * Cached tensors (field names kept for ABI stability, but their semantic
+ * meaning is different from the old Post-LN implementation):
+ *   cache->x         = layer input x
+ *   cache->ln1_out   = LN1(x)             (input to self-attn)
+ *   cache->residual  = y1                 (pre-LN input to LN2)
+ *   cache->ln2_out   = LN2(y1)            (input to FFN)
+ *   cache->ffn_hidden_pre = FFN pre-activation
+ *   cache->ff_out    = y2                 (this layer's output)
+ */
 Tensor3D encoder_layer_forward(EncoderLayer *layer, Tensor3D *x, Tensor3D *mask,
                                EncoderLayerCache *cache) {
     if (cache) cache->x = tensor_clone(x);
 
+    Tensor3D ln1_out = tensor_clone(x);
+    tensor_layer_norm_inplace(&ln1_out, layer->ln1_gamma, layer->ln1_beta, 1e-5f);
+    if (cache) cache->ln1_out = tensor_clone(&ln1_out);
+
     AttnCache *attn_cache = cache ? &cache->self_attn_cache : NULL;
-    Tensor3D attn_out = multi_head_attn_forward(layer->self_attn, x, x, x, mask, attn_cache);
+    Tensor3D attn_out = multi_head_attn_forward(layer->self_attn,
+                                                &ln1_out, &ln1_out, &ln1_out,
+                                                mask, attn_cache);
+    tensor_free(&ln1_out);
 
-    Tensor3D residual = tensor_clone(x);
-    tensor_add_inplace(&residual, &attn_out);
+    Tensor3D y1 = tensor_clone(x);
+    tensor_add_inplace(&y1, &attn_out);
     tensor_free(&attn_out);
+    if (cache) cache->residual = tensor_clone(&y1);
 
-    if (cache) cache->residual = tensor_clone(&residual);
-    tensor_layer_norm_inplace(&residual, layer->ln1_gamma, layer->ln1_beta, 1e-5f);
-    if (cache) cache->ln1_out = tensor_clone(&residual);
+    Tensor3D ln2_out = tensor_clone(&y1);
+    tensor_layer_norm_inplace(&ln2_out, layer->ln2_gamma, layer->ln2_beta, 1e-5f);
+    if (cache) cache->ln2_out = tensor_clone(&ln2_out);
 
     Tensor3D *hidden_ptr = NULL;
     if (cache) {
         cache->ffn_hidden_pre = tensor_create(x->batch_size, x->seq_len, layer->ffn->d_ff);
         hidden_ptr = &cache->ffn_hidden_pre;
     }
-    Tensor3D ff_out = feed_forward_forward(layer->ffn, &residual, hidden_ptr);
-    tensor_add_inplace(&ff_out, &residual);
+    Tensor3D ff_out = feed_forward_forward(layer->ffn, &ln2_out, hidden_ptr);
+    tensor_free(&ln2_out);
 
-    if (cache) cache->ff_out = tensor_clone(&ff_out);
-    tensor_free(&residual);
-    tensor_layer_norm_inplace(&ff_out, layer->ln2_gamma, layer->ln2_beta, 1e-5f);
-    if (cache) cache->ln2_out = tensor_clone(&ff_out);
+    Tensor3D y2 = tensor_clone(&y1);
+    tensor_add_inplace(&y2, &ff_out);
+    tensor_free(&ff_out);
+    tensor_free(&y1);
 
-    return ff_out;
+    if (cache) cache->ff_out = tensor_clone(&y2);
+    return y2;
 }
 
+/* Pre-LN encoder backward.
+ *
+ * Forward (recap):
+ *   ln1_out = LN1(x)
+ *   y1 = x + Attn(ln1_out)
+ *   ln2_out = LN2(y1)
+ *   y2 = y1 + FFN(ln2_out)
+ *
+ * Given grad_y2 (= grad_output) we propagate as:
+ *   grad_y1   = grad_y2 + LN2_bwd( y1, FFN_bwd(ln2_out, grad_y2) )
+ *   grad_x    = grad_y1 + LN1_bwd( x,  Attn_bwd(ln1_out, grad_y1) )
+ */
 static void encoder_layer_backward(EncoderLayer *layer, EncoderLayerCache *cache,
                                    Tensor3D *grad_output, Tensor3D *grad_input,
                                    TrainingState *ts) {
@@ -719,47 +756,53 @@ static void encoder_layer_backward(EncoderLayer *layer, EncoderLayerCache *cache
     Matrix *d_ln1_gamma = training_state_find_grad(ts, layer->ln1_gamma);
     Matrix *d_ln1_beta  = training_state_find_grad(ts, layer->ln1_beta);
 
-    /* Backprop through LN2.  ff_out is the pre-LN input. */
-    Tensor3D grad_ln2 = tensor_create(batch_size, seq_len, d_model);
-    tensor_layer_norm_backward(&cache->ff_out, grad_output, layer->ln2_gamma, &grad_ln2,
-                               1e-5f, d_ln2_gamma, d_ln2_beta);
+    /* Split y2 = y1 + FFN(LN2(y1)): two paths into grad_y1. */
+    Tensor3D grad_y1 = tensor_clone(grad_output);   /* residual path */
+    Tensor3D grad_ff = tensor_clone(grad_output);   /* FFN path */
 
-    /* ff_out = ln1_out + FFN(ln1_out): split into two paths. */
-    Tensor3D grad_residual2 = tensor_clone(&grad_ln2);
-    Tensor3D grad_ff = tensor_clone(&grad_ln2);
-    tensor_free(&grad_ln2);
-
-    Tensor3D grad_ln1_out_from_ff = tensor_create(batch_size, seq_len, d_model);
-    feed_forward_backward(layer->ffn, &cache->ln1_out, &grad_ff, &grad_ln1_out_from_ff,
+    /* FFN backward: input was ln2_out. */
+    Tensor3D grad_ln2_out = tensor_create(batch_size, seq_len, d_model);
+    feed_forward_backward(layer->ffn, &cache->ln2_out, &grad_ff, &grad_ln2_out,
                           &cache->ffn_hidden_pre, ts);
-    tensor_add_inplace(&grad_residual2, &grad_ln1_out_from_ff);
     tensor_free(&grad_ff);
-    tensor_free(&grad_ln1_out_from_ff);
 
-    /* Backprop through LN1. */
-    Tensor3D grad_ln1_in = tensor_create(batch_size, seq_len, d_model);
-    tensor_layer_norm_backward(&cache->residual, &grad_residual2, layer->ln1_gamma, &grad_ln1_in,
-                               1e-5f, d_ln1_gamma, d_ln1_beta);
-    tensor_free(&grad_residual2);
+    /* LN2 backward: pre-LN tensor is y1 (cached as cache->residual). */
+    Tensor3D grad_y1_from_ffn = tensor_create(batch_size, seq_len, d_model);
+    tensor_layer_norm_backward(&cache->residual, &grad_ln2_out, layer->ln2_gamma,
+                               &grad_y1_from_ffn, 1e-5f, d_ln2_gamma, d_ln2_beta);
+    tensor_free(&grad_ln2_out);
 
-    /* residual = x + Attn(x): split into two paths. */
-    Tensor3D grad_x_from_residual = tensor_clone(&grad_ln1_in);
-    Tensor3D grad_attn_out = tensor_clone(&grad_ln1_in);
-    tensor_free(&grad_ln1_in);
+    tensor_add_inplace(&grad_y1, &grad_y1_from_ffn);
+    tensor_free(&grad_y1_from_ffn);
+
+    /* Split y1 = x + Attn(LN1(x)): two paths into grad_x. */
+    Tensor3D grad_x_residual = tensor_clone(&grad_y1);
+    Tensor3D grad_attn_out = grad_y1;  /* take ownership; do not free again */
+
+    /* Self-attn backward: q/k/v were all ln1_out, gradients alias. */
+    Tensor3D grad_ln1_out = tensor_create(batch_size, seq_len, d_model);
+    multi_head_attn_backward(layer->self_attn,
+                             &cache->ln1_out, &cache->ln1_out, &cache->ln1_out,
+                             &grad_attn_out,
+                             &grad_ln1_out, &grad_ln1_out, &grad_ln1_out,
+                             &cache->self_attn_cache, ts);
+    tensor_free(&grad_attn_out);
+
+    /* LN1 backward: pre-LN tensor is x. */
+    Tensor3D grad_x_from_attn = tensor_create(batch_size, seq_len, d_model);
+    tensor_layer_norm_backward(&cache->x, &grad_ln1_out, layer->ln1_gamma,
+                               &grad_x_from_attn, 1e-5f, d_ln1_gamma, d_ln1_beta);
+    tensor_free(&grad_ln1_out);
 
     grad_input->batch_size = batch_size;
     grad_input->seq_len = seq_len;
     grad_input->d_model = d_model;
     grad_input->data = (float *)calloc((size_t)batch_size * seq_len * d_model, sizeof(float));
+    tensor_add_inplace(grad_input, &grad_x_residual);
+    tensor_add_inplace(grad_input, &grad_x_from_attn);
 
-    multi_head_attn_backward(layer->self_attn, &cache->x, &cache->x, &cache->x,
-                             &grad_attn_out,
-                             grad_input, grad_input, grad_input,
-                             &cache->self_attn_cache, ts);
-    tensor_add_inplace(grad_input, &grad_x_from_residual);
-
-    tensor_free(&grad_x_from_residual);
-    tensor_free(&grad_attn_out);
+    tensor_free(&grad_x_residual);
+    tensor_free(&grad_x_from_attn);
 }
 
 /* =========================================================================
@@ -800,6 +843,25 @@ void decoder_layer_free(DecoderLayer *layer) {
     matrix_free(layer->ln3_beta);  free(layer->ln3_beta);
 }
 
+/* Pre-LN decoder layer:
+ *
+ *   ln1_out = LN1(x)
+ *   y1      = x  + SelfAttn(ln1_out, ln1_out, ln1_out, tgt_mask)
+ *   ln2_out = LN2(y1)
+ *   y2      = y1 + CrossAttn(ln2_out, encoder_out, encoder_out, src_mask)
+ *   ln3_out = LN3(y2)
+ *   y3      = y2 + FFN(ln3_out)
+ *
+ * Cache fields (semantic remap from old Post-LN):
+ *   cache->x         = layer input x
+ *   cache->ln1_out   = LN1(x)            (input to self-attn)
+ *   cache->residual1 = y1                (pre-LN input to LN2)
+ *   cache->ln2_out   = LN2(y1)           (input to cross-attn query)
+ *   cache->residual2 = y2                (pre-LN input to LN3)
+ *   cache->ln3_out   = LN3(y2)           (input to FFN)
+ *   cache->ff_out    = y3                (this layer's output)
+ *   cache->encoder_out = encoder_out (unchanged)
+ */
 Tensor3D decoder_layer_forward(DecoderLayer *layer, Tensor3D *x, Tensor3D *encoder_out,
                                Tensor3D *src_mask, Tensor3D *tgt_mask,
                                DecoderLayerCache *cache) {
@@ -808,47 +870,65 @@ Tensor3D decoder_layer_forward(DecoderLayer *layer, Tensor3D *x, Tensor3D *encod
         cache->encoder_out = tensor_clone(encoder_out);
     }
 
+    Tensor3D ln1_out = tensor_clone(x);
+    tensor_layer_norm_inplace(&ln1_out, layer->ln1_gamma, layer->ln1_beta, 1e-5f);
+    if (cache) cache->ln1_out = tensor_clone(&ln1_out);
+
     AttnCache *self_cache = cache ? &cache->self_attn_cache : NULL;
-    Tensor3D self_out = multi_head_attn_forward(layer->self_attn, x, x, x, tgt_mask, self_cache);
+    Tensor3D self_out = multi_head_attn_forward(layer->self_attn,
+                                                &ln1_out, &ln1_out, &ln1_out,
+                                                tgt_mask, self_cache);
+    tensor_free(&ln1_out);
 
-    Tensor3D residual1 = tensor_clone(x);
-    tensor_add_inplace(&residual1, &self_out);
+    Tensor3D y1 = tensor_clone(x);
+    tensor_add_inplace(&y1, &self_out);
     tensor_free(&self_out);
+    if (cache) cache->residual1 = tensor_clone(&y1);
 
-    if (cache) cache->residual1 = tensor_clone(&residual1);
-    tensor_layer_norm_inplace(&residual1, layer->ln1_gamma, layer->ln1_beta, 1e-5f);
-    if (cache) cache->ln1_out = tensor_clone(&residual1);
+    Tensor3D ln2_out = tensor_clone(&y1);
+    tensor_layer_norm_inplace(&ln2_out, layer->ln2_gamma, layer->ln2_beta, 1e-5f);
+    if (cache) cache->ln2_out = tensor_clone(&ln2_out);
 
     AttnCache *cross_cache = cache ? &cache->cross_attn_cache : NULL;
-    Tensor3D cross_out = multi_head_attn_forward(layer->cross_attn, &residual1,
-                                                 encoder_out, encoder_out,
+    Tensor3D cross_out = multi_head_attn_forward(layer->cross_attn,
+                                                 &ln2_out, encoder_out, encoder_out,
                                                  src_mask, cross_cache);
+    tensor_free(&ln2_out);
 
-    Tensor3D residual2 = tensor_clone(&residual1);
-    tensor_add_inplace(&residual2, &cross_out);
+    Tensor3D y2 = tensor_clone(&y1);
+    tensor_add_inplace(&y2, &cross_out);
     tensor_free(&cross_out);
+    tensor_free(&y1);
+    if (cache) cache->residual2 = tensor_clone(&y2);
 
-    if (cache) cache->residual2 = tensor_clone(&residual2);
-    tensor_layer_norm_inplace(&residual2, layer->ln2_gamma, layer->ln2_beta, 1e-5f);
-    if (cache) cache->ln2_out = tensor_clone(&residual2);
+    Tensor3D ln3_out = tensor_clone(&y2);
+    tensor_layer_norm_inplace(&ln3_out, layer->ln3_gamma, layer->ln3_beta, 1e-5f);
+    if (cache) cache->ln3_out = tensor_clone(&ln3_out);
 
     Tensor3D *hidden_ptr = NULL;
     if (cache) {
         cache->ffn_hidden_pre = tensor_create(x->batch_size, x->seq_len, layer->ffn->d_ff);
         hidden_ptr = &cache->ffn_hidden_pre;
     }
-    Tensor3D ff_out = feed_forward_forward(layer->ffn, &residual2, hidden_ptr);
-    tensor_add_inplace(&ff_out, &residual2);
+    Tensor3D ff_out = feed_forward_forward(layer->ffn, &ln3_out, hidden_ptr);
+    tensor_free(&ln3_out);
 
-    if (cache) cache->ff_out = tensor_clone(&ff_out);
-    tensor_layer_norm_inplace(&ff_out, layer->ln3_gamma, layer->ln3_beta, 1e-5f);
-    if (cache) cache->ln3_out = tensor_clone(&ff_out);
+    Tensor3D y3 = tensor_clone(&y2);
+    tensor_add_inplace(&y3, &ff_out);
+    tensor_free(&ff_out);
+    tensor_free(&y2);
 
-    tensor_free(&residual1);
-    tensor_free(&residual2);
-    return ff_out;
+    if (cache) cache->ff_out = tensor_clone(&y3);
+    return y3;
 }
 
+/* Pre-LN decoder backward.
+ *
+ * Forward (recap):
+ *   ln1_out = LN1(x);              y1 = x  + SelfAttn(ln1_out, mask)
+ *   ln2_out = LN2(y1);             y2 = y1 + CrossAttn(ln2_out, enc_out)
+ *   ln3_out = LN3(y2);             y3 = y2 + FFN(ln3_out)
+ */
 static void decoder_layer_backward(DecoderLayer *layer, DecoderLayerCache *cache,
                                    Tensor3D *grad_output, Tensor3D *grad_input,
                                    Tensor3D *grad_encoder_out, TrainingState *ts) {
@@ -863,71 +943,77 @@ static void decoder_layer_backward(DecoderLayer *layer, DecoderLayerCache *cache
     Matrix *d_ln1_gamma = training_state_find_grad(ts, layer->ln1_gamma);
     Matrix *d_ln1_beta  = training_state_find_grad(ts, layer->ln1_beta);
 
-    /* Backprop through LN3, then through (residual2 + FFN(ln2_out)). */
-    Tensor3D grad_ln3 = tensor_create(batch_size, seq_len, d_model);
-    tensor_layer_norm_backward(&cache->ff_out, grad_output, layer->ln3_gamma, &grad_ln3,
-                               1e-5f, d_ln3_gamma, d_ln3_beta);
+    /* === Step 1: y3 = y2 + FFN(LN3(y2))  ===========================
+     * Split into residual + FFN paths, then unwind LN3. */
+    Tensor3D grad_y2 = tensor_clone(grad_output);   /* residual */
+    Tensor3D grad_ff = tensor_clone(grad_output);   /* FFN path */
 
-    Tensor3D grad_residual3 = tensor_clone(&grad_ln3);
-    Tensor3D grad_ff = tensor_clone(&grad_ln3);
-    tensor_free(&grad_ln3);
-
-    Tensor3D grad_ln2_out_from_ff = tensor_create(batch_size, seq_len, d_model);
-    feed_forward_backward(layer->ffn, &cache->ln2_out, &grad_ff, &grad_ln2_out_from_ff,
+    Tensor3D grad_ln3_out = tensor_create(batch_size, seq_len, d_model);
+    feed_forward_backward(layer->ffn, &cache->ln3_out, &grad_ff, &grad_ln3_out,
                           &cache->ffn_hidden_pre, ts);
-    tensor_add_inplace(&grad_residual3, &grad_ln2_out_from_ff);
     tensor_free(&grad_ff);
-    tensor_free(&grad_ln2_out_from_ff);
 
-    /* Backprop through LN2: pre-LN tensor is residual2. */
-    Tensor3D grad_ln2_in = tensor_create(batch_size, seq_len, d_model);
-    tensor_layer_norm_backward(&cache->residual2, &grad_residual3, layer->ln2_gamma, &grad_ln2_in,
-                               1e-5f, d_ln2_gamma, d_ln2_beta);
-    tensor_free(&grad_residual3);
+    Tensor3D grad_y2_from_ffn = tensor_create(batch_size, seq_len, d_model);
+    tensor_layer_norm_backward(&cache->residual2, &grad_ln3_out, layer->ln3_gamma,
+                               &grad_y2_from_ffn, 1e-5f, d_ln3_gamma, d_ln3_beta);
+    tensor_free(&grad_ln3_out);
 
-    /* residual2 = ln1_out + cross_attn(ln1_out, encoder_out): two paths. */
-    Tensor3D grad_ln1_out_from_residual = tensor_clone(&grad_ln2_in);
-    Tensor3D grad_cross_input = tensor_clone(&grad_ln2_in);
-    tensor_free(&grad_ln2_in);
+    tensor_add_inplace(&grad_y2, &grad_y2_from_ffn);
+    tensor_free(&grad_y2_from_ffn);
 
-    /* Cross-attention: query = ln1_out, key=value = encoder_out. */
-    Tensor3D grad_ln1_out_from_cross = tensor_create(batch_size, seq_len, d_model);
+    /* === Step 2: y2 = y1 + CrossAttn(LN2(y1), encoder_out)  ========= */
+    Tensor3D grad_y1 = tensor_clone(&grad_y2);     /* residual into y1 */
+    Tensor3D grad_cross_out = grad_y2;             /* cross-attn output grad */
+
+    /* Cross-attn backward: query=ln2_out, key=value=encoder_out. */
+    Tensor3D grad_ln2_out = tensor_create(batch_size, seq_len, d_model);
     Tensor3D grad_enc_local = tensor_create(batch_size, seq_len, d_model);
     multi_head_attn_backward(layer->cross_attn,
-                             &cache->ln1_out, &cache->encoder_out, &cache->encoder_out,
-                             &grad_cross_input,
-                             &grad_ln1_out_from_cross, &grad_enc_local, &grad_enc_local,
+                             &cache->ln2_out, &cache->encoder_out, &cache->encoder_out,
+                             &grad_cross_out,
+                             &grad_ln2_out, &grad_enc_local, &grad_enc_local,
                              &cache->cross_attn_cache, ts);
     tensor_add_inplace(grad_encoder_out, &grad_enc_local);
     tensor_free(&grad_enc_local);
-    tensor_free(&grad_cross_input);
+    tensor_free(&grad_cross_out);
 
-    tensor_add_inplace(&grad_ln1_out_from_residual, &grad_ln1_out_from_cross);
-    tensor_free(&grad_ln1_out_from_cross);
+    /* LN2 backward: pre-LN tensor is y1 (cache->residual1). */
+    Tensor3D grad_y1_from_cross = tensor_create(batch_size, seq_len, d_model);
+    tensor_layer_norm_backward(&cache->residual1, &grad_ln2_out, layer->ln2_gamma,
+                               &grad_y1_from_cross, 1e-5f, d_ln2_gamma, d_ln2_beta);
+    tensor_free(&grad_ln2_out);
 
-    /* Backprop through LN1: pre-LN tensor is residual1. */
-    Tensor3D grad_ln1_in = tensor_create(batch_size, seq_len, d_model);
-    tensor_layer_norm_backward(&cache->residual1, &grad_ln1_out_from_residual, layer->ln1_gamma,
-                               &grad_ln1_in, 1e-5f, d_ln1_gamma, d_ln1_beta);
-    tensor_free(&grad_ln1_out_from_residual);
+    tensor_add_inplace(&grad_y1, &grad_y1_from_cross);
+    tensor_free(&grad_y1_from_cross);
 
-    /* residual1 = x + self_attn(x). */
-    Tensor3D grad_x_from_residual = tensor_clone(&grad_ln1_in);
-    Tensor3D grad_self_input = tensor_clone(&grad_ln1_in);
-    tensor_free(&grad_ln1_in);
+    /* === Step 3: y1 = x + SelfAttn(LN1(x))  ======================== */
+    Tensor3D grad_x_residual = tensor_clone(&grad_y1);
+    Tensor3D grad_self_out = grad_y1;
+
+    /* Self-attn backward: q/k/v all = ln1_out; gradients alias. */
+    Tensor3D grad_ln1_out = tensor_create(batch_size, seq_len, d_model);
+    multi_head_attn_backward(layer->self_attn,
+                             &cache->ln1_out, &cache->ln1_out, &cache->ln1_out,
+                             &grad_self_out,
+                             &grad_ln1_out, &grad_ln1_out, &grad_ln1_out,
+                             &cache->self_attn_cache, ts);
+    tensor_free(&grad_self_out);
+
+    /* LN1 backward: pre-LN tensor is x. */
+    Tensor3D grad_x_from_attn = tensor_create(batch_size, seq_len, d_model);
+    tensor_layer_norm_backward(&cache->x, &grad_ln1_out, layer->ln1_gamma,
+                               &grad_x_from_attn, 1e-5f, d_ln1_gamma, d_ln1_beta);
+    tensor_free(&grad_ln1_out);
 
     grad_input->batch_size = batch_size;
     grad_input->seq_len = seq_len;
     grad_input->d_model = d_model;
     grad_input->data = (float *)calloc((size_t)batch_size * seq_len * d_model, sizeof(float));
+    tensor_add_inplace(grad_input, &grad_x_residual);
+    tensor_add_inplace(grad_input, &grad_x_from_attn);
 
-    multi_head_attn_backward(layer->self_attn, &cache->x, &cache->x, &cache->x,
-                             &grad_self_input,
-                             grad_input, grad_input, grad_input,
-                             &cache->self_attn_cache, ts);
-    tensor_add_inplace(grad_input, &grad_x_from_residual);
-    tensor_free(&grad_x_from_residual);
-    tensor_free(&grad_self_input);
+    tensor_free(&grad_x_residual);
+    tensor_free(&grad_x_from_attn);
 }
 
 /* =========================================================================
@@ -1044,6 +1130,24 @@ Transformer *transformer_create(TransformerConfig *config) {
     *t->output_projection = matrix_create(config->d_model, config->d_model);
     matrix_init_xavier(t->output_projection);
 
+    if (config->vocab_size > 0) {
+        /* Token embedding is laid out as (vocab_size rows, d_model cols);
+         * lookup picks a row of length d_model. */
+        t->token_embedding = (Matrix *)malloc(sizeof(Matrix));
+        *t->token_embedding = matrix_create(config->vocab_size, config->d_model);
+        matrix_init_xavier(t->token_embedding);
+
+        /* Logit head is a linear layer mapping d_model -> vocab_size. The
+         * code-base stores linear weights as (in_dim rows, out_dim cols),
+         * so logit_head has shape (d_model, vocab_size). */
+        t->logit_head = (Matrix *)malloc(sizeof(Matrix));
+        *t->logit_head = matrix_create(config->d_model, config->vocab_size);
+        matrix_init_xavier(t->logit_head);
+    } else {
+        t->token_embedding = NULL;
+        t->logit_head = NULL;
+    }
+
     return t;
 }
 
@@ -1052,6 +1156,12 @@ void transformer_free(Transformer *t) {
     decoder_free(t->decoder);
     matrix_free(t->input_projection); free(t->input_projection);
     matrix_free(t->output_projection); free(t->output_projection);
+    if (t->token_embedding) {
+        matrix_free(t->token_embedding); free(t->token_embedding);
+    }
+    if (t->logit_head) {
+        matrix_free(t->logit_head); free(t->logit_head);
+    }
     free(t);
 }
 
@@ -1146,6 +1256,394 @@ void transformer_backward(Transformer *t, TransformerCache *cache,
 
     tensor_free(&grad_decoder_out);
     tensor_free(&grad_encoder_out);
+}
+
+/* =========================================================================
+ * Language-model forward / backward: explicit token embedding + logit head.
+ *
+ * Replaces the legacy d_model-space one-hot input + d_model-space "logits"
+ * pipeline. Vocab size is decoupled from d_model.
+ * ========================================================================= */
+
+static void embed_lookup(const Matrix *embedding, const int *ids,
+                         Tensor3D *out) {
+    int batch_size = out->batch_size;
+    int seq_len = out->seq_len;
+    int d_model = out->d_model;
+    int vocab_size = embedding->rows;
+    for (int b = 0; b < batch_size; b++) {
+        for (int s = 0; s < seq_len; s++) {
+            int tok = ids[b * seq_len + s];
+            if (tok < 0 || tok >= vocab_size) tok = 0;
+            const float *row = embedding->data + (size_t)tok * (size_t)d_model;
+            float *dst = out->data + ((size_t)b * seq_len + s) * d_model;
+            memcpy(dst, row, sizeof(float) * (size_t)d_model);
+        }
+    }
+}
+
+static void embed_scatter_add(Matrix *grad_embedding, const int *ids,
+                              const Tensor3D *grad_out) {
+    int batch_size = grad_out->batch_size;
+    int seq_len = grad_out->seq_len;
+    int d_model = grad_out->d_model;
+    int vocab_size = grad_embedding->rows;
+    for (int b = 0; b < batch_size; b++) {
+        for (int s = 0; s < seq_len; s++) {
+            int tok = ids[b * seq_len + s];
+            if (tok < 0 || tok >= vocab_size) continue;
+            float *dst = grad_embedding->data + (size_t)tok * (size_t)d_model;
+            const float *src = grad_out->data + ((size_t)b * seq_len + s) * d_model;
+            for (int d = 0; d < d_model; d++) dst[d] += src[d];
+        }
+    }
+}
+
+Tensor3D transformer_forward_lm(Transformer *t,
+                                const int *src_ids, int src_len,
+                                const int *tgt_ids, int tgt_len,
+                                int batch_size,
+                                Tensor3D *src_mask, Tensor3D *tgt_mask,
+                                TransformerCache *cache) {
+    int d_model = t->config.d_model;
+    int vocab_size = t->config.vocab_size;
+    (void)vocab_size;
+
+    /* Embedding lookup. */
+    Tensor3D src_emb = tensor_create(batch_size, src_len, d_model);
+    Tensor3D tgt_emb = tensor_create(batch_size, tgt_len, d_model);
+    embed_lookup(t->token_embedding, src_ids, &src_emb);
+    embed_lookup(t->token_embedding, tgt_ids, &tgt_emb);
+
+    /* Encoder. */
+    Tensor3D encoder_out;
+    if (cache) {
+        encoder_out = encoder_forward(t->encoder, &src_emb, src_mask, &cache->encoder_cache);
+    } else {
+        encoder_out = encoder_forward(t->encoder, &src_emb, src_mask, NULL);
+    }
+    tensor_free(&src_emb);
+
+    /* Decoder. */
+    Tensor3D decoder_out;
+    if (cache) {
+        decoder_out = decoder_forward(t->decoder, &tgt_emb, &encoder_out,
+                                      src_mask, tgt_mask, &cache->decoder_cache);
+        cache->decoder_out = tensor_clone(&decoder_out);
+    } else {
+        decoder_out = decoder_forward(t->decoder, &tgt_emb, &encoder_out,
+                                      src_mask, tgt_mask, NULL);
+        tensor_free(&encoder_out);
+    }
+    tensor_free(&tgt_emb);
+
+    /* Logit head: logits = decoder_out @ logit_head^T -> (B, S_tgt, vocab). */
+    Tensor3D logits = tensor_create(batch_size, tgt_len, vocab_size);
+    tensor_linear_forward(&decoder_out, t->logit_head, &logits);
+
+    if (!cache) tensor_free(&decoder_out);
+    return logits;
+}
+
+void transformer_backward_lm(Transformer *t, TransformerCache *cache,
+                             Tensor3D *grad_logits,
+                             const int *src_ids, const int *tgt_ids,
+                             TrainingState *ts) {
+    int batch_size = grad_logits->batch_size;
+    int tgt_len = grad_logits->seq_len;
+    int d_model = t->config.d_model;
+    int vocab_size = t->config.vocab_size;
+
+    Tensor3D *decoder_out = &cache->decoder_out;
+
+    /* === Logit head backward.
+     * logits = decoder_out @ logit_head^T, with logit_head shape
+     * (vocab_size, d_model). */
+    Matrix *d_logit_head = training_state_find_grad(ts, t->logit_head);
+    Tensor3D grad_decoder_out = tensor_create(batch_size, tgt_len, d_model);
+    linear_backward(t->logit_head, decoder_out->data, grad_logits->data,
+                    batch_size, tgt_len, d_model, vocab_size,
+                    d_logit_head, grad_decoder_out.data);
+
+    /* === Decoder layers backward. === */
+    Tensor3D grad_encoder_out = tensor_create(
+        batch_size,
+        cache->decoder_cache.encoder_out.seq_len,
+        d_model);
+    tensor_zero(&grad_encoder_out);
+    for (int i = t->decoder->num_layers - 1; i >= 0; i--) {
+        DecoderLayerCache *dlc = &cache->decoder_cache.layer_caches[i];
+        Tensor3D grad_dec_in = {0};
+        decoder_layer_backward(&t->decoder->layers[i], dlc, &grad_decoder_out,
+                               &grad_dec_in, &grad_encoder_out, ts);
+        tensor_free(&grad_decoder_out);
+        grad_decoder_out = grad_dec_in;
+    }
+    /* `grad_decoder_out` is now grad of the tgt embedding (post-PE). The
+     * positional encoding is added in-place inside decoder_forward; since
+     * PE is parameter-free, its gradient passes through unchanged, so
+     * grad_decoder_out is also the grad of tgt_emb itself. */
+
+    /* === Encoder layers backward. === */
+    for (int i = t->encoder->num_layers - 1; i >= 0; i--) {
+        EncoderLayerCache *elc = &cache->encoder_cache.layer_caches[i];
+        Tensor3D grad_enc_in = {0};
+        encoder_layer_backward(&t->encoder->layers[i], elc, &grad_encoder_out, &grad_enc_in, ts);
+        tensor_free(&grad_encoder_out);
+        grad_encoder_out = grad_enc_in;
+    }
+    /* `grad_encoder_out` is now grad of the src embedding. */
+
+    /* === Embedding scatter-add. === */
+    Matrix *d_token_emb = training_state_find_grad(ts, t->token_embedding);
+    if (d_token_emb) {
+        embed_scatter_add(d_token_emb, src_ids, &grad_encoder_out);
+        embed_scatter_add(d_token_emb, tgt_ids, &grad_decoder_out);
+    }
+
+    tensor_free(&grad_decoder_out);
+    tensor_free(&grad_encoder_out);
+}
+
+/* =========================================================================
+ * Incremental decoding with KV cache (inference-only, batch_size == 1).
+ *
+ * The cache pre-projects all encoder_out -> Wk/Wv for cross-attention so
+ * those reads are reused for every decoder step. Self-attn K/V are appended
+ * one row at a time as new tokens come in.
+ *
+ * Memory per decoder layer: 2 * max_len * d_model floats for self-attn,
+ *                           2 * src_len * d_model floats for cross-attn.
+ * ========================================================================= */
+
+/* Single-query multi-head attention. The query is one position; keys/values
+ * span k_len positions. q_proj/k_proj/v_proj are already projected through
+ * Wq/Wk/Wv. Returns the (1,1,d_model) tensor `attended @ Wo`. */
+static Tensor3D attn_step_compute(MultiHeadAttention *attn,
+                                  const float *q_proj, const float *k_proj,
+                                  const float *v_proj, int k_len) {
+    int num_heads = attn->num_heads;
+    int head_dim = attn->head_dim;
+    int d_model = num_heads * head_dim;
+    float scale = sqrtf((float)head_dim);
+
+    Tensor3D merged = tensor_create(1, 1, d_model);
+    float *scores = (float *)malloc(sizeof(float) * (size_t)k_len);
+
+    for (int h = 0; h < num_heads; h++) {
+        const float *qh = q_proj + h * head_dim;
+
+        /* scores[k_pos] = (q_h dot K_h[k_pos]) / sqrt(head_dim) */
+        float max_score = -INFINITY;
+        for (int k_pos = 0; k_pos < k_len; k_pos++) {
+            const float *kh = k_proj + k_pos * d_model + h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += qh[d] * kh[d];
+            float s = dot / scale;
+            scores[k_pos] = s;
+            if (s > max_score) max_score = s;
+        }
+
+        /* softmax */
+        float sum_exp = 0.0f;
+        for (int k_pos = 0; k_pos < k_len; k_pos++) {
+            scores[k_pos] = expf(scores[k_pos] - max_score);
+            sum_exp += scores[k_pos];
+        }
+        float inv = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+        for (int k_pos = 0; k_pos < k_len; k_pos++) scores[k_pos] *= inv;
+
+        /* attended_h[d] = sum_k_pos scores[k_pos] * V_h[k_pos][d] */
+        float *out_h = merged.data + h * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            float s = 0.0f;
+            for (int k_pos = 0; k_pos < k_len; k_pos++) {
+                const float *vh = v_proj + k_pos * d_model + h * head_dim;
+                s += scores[k_pos] * vh[d];
+            }
+            out_h[d] = s;
+        }
+    }
+    free(scores);
+
+    /* Output projection: merged @ Wo. */
+    Tensor3D out = tensor_create(1, 1, d_model);
+    tensor_linear_forward(&merged, attn->Wo, &out);
+    tensor_free(&merged);
+    return out;
+}
+
+TransformerKVCache *transformer_kv_cache_create(const Transformer *t, int max_len) {
+    if (!t || t->config.vocab_size <= 0) return NULL;
+    TransformerKVCache *c = (TransformerKVCache *)calloc(1, sizeof(TransformerKVCache));
+    if (!c) return NULL;
+    int num_layers = t->decoder->num_layers;
+    int d_model = t->config.d_model;
+    c->num_layers = num_layers;
+    c->d_model = d_model;
+    c->max_len = max_len;
+    c->cur_len = 0;
+    c->src_len = 0;
+    c->layers = (DecoderLayerKV *)calloc((size_t)num_layers, sizeof(DecoderLayerKV));
+    for (int i = 0; i < num_layers; i++) {
+        c->layers[i].self_k = (float *)calloc((size_t)max_len * d_model, sizeof(float));
+        c->layers[i].self_v = (float *)calloc((size_t)max_len * d_model, sizeof(float));
+        /* cross_k/cross_v are sized in init_cache once src_len is known. */
+        c->layers[i].cross_k = NULL;
+        c->layers[i].cross_v = NULL;
+    }
+    return c;
+}
+
+void transformer_kv_cache_free(TransformerKVCache *cache) {
+    if (!cache) return;
+    for (int i = 0; i < cache->num_layers; i++) {
+        free(cache->layers[i].self_k);
+        free(cache->layers[i].self_v);
+        free(cache->layers[i].cross_k);
+        free(cache->layers[i].cross_v);
+    }
+    free(cache->layers);
+    free(cache);
+}
+
+void transformer_lm_init_cache(Transformer *t,
+                               const int *src_ids, int src_len,
+                               TransformerKVCache *cache) {
+    if (!t || !cache || t->config.vocab_size <= 0) return;
+    int d_model = t->config.d_model;
+
+    /* 1. Embed src tokens. */
+    Tensor3D src_emb = tensor_create(1, src_len, d_model);
+    embed_lookup(t->token_embedding, src_ids, &src_emb);
+
+    /* 2. Run the encoder once (no training cache needed). */
+    Tensor3D encoder_out = encoder_forward(t->encoder, &src_emb, NULL, NULL);
+    tensor_free(&src_emb);
+
+    /* 3. Reset self-attn buffers and pre-project cross-attn K/V per layer. */
+    cache->cur_len = 0;
+    cache->src_len = src_len;
+    for (int i = 0; i < t->decoder->num_layers; i++) {
+        DecoderLayer *layer = &t->decoder->layers[i];
+        DecoderLayerKV *kv = &cache->layers[i];
+
+        /* Reset self-attn cache to zero (cur_len was the cap before). */
+        memset(kv->self_k, 0, sizeof(float) * (size_t)cache->max_len * d_model);
+        memset(kv->self_v, 0, sizeof(float) * (size_t)cache->max_len * d_model);
+
+        /* (Re)allocate cross-attn buffers to fit the new src_len. */
+        free(kv->cross_k);
+        free(kv->cross_v);
+        kv->cross_k = (float *)calloc((size_t)src_len * d_model, sizeof(float));
+        kv->cross_v = (float *)calloc((size_t)src_len * d_model, sizeof(float));
+
+        /* Pre-project encoder_out through this layer's cross-attn Wk / Wv.
+         * tensor_linear_forward expects Tensor3D; build a temporary view. */
+        Tensor3D ck = {.batch_size = 1, .seq_len = src_len, .d_model = d_model,
+                       .data = kv->cross_k};
+        Tensor3D cv = {.batch_size = 1, .seq_len = src_len, .d_model = d_model,
+                       .data = kv->cross_v};
+        tensor_linear_forward(&encoder_out, layer->cross_attn->Wk, &ck);
+        tensor_linear_forward(&encoder_out, layer->cross_attn->Wv, &cv);
+    }
+    tensor_free(&encoder_out);
+}
+
+Tensor3D transformer_lm_step(Transformer *t, int next_token,
+                             TransformerKVCache *cache) {
+    int d_model = t->config.d_model;
+    int vocab_size = t->config.vocab_size;
+    int pos = cache->cur_len;
+    if (pos >= cache->max_len) {
+        /* Soft cap: reuse last slot (caller should size max_len appropriately). */
+        pos = cache->max_len - 1;
+    }
+
+    /* === Embedding + positional encoding for the new token. === */
+    Tensor3D x = tensor_create(1, 1, d_model);
+    int tok = (next_token >= 0 && next_token < t->token_embedding->rows)
+              ? next_token : 0;
+    memcpy(x.data,
+           t->token_embedding->data + (size_t)tok * d_model,
+           sizeof(float) * (size_t)d_model);
+    PositionalEncoding *pe = t->decoder->pe;
+    if (pe && pe->table && pos < pe->max_len) {
+        for (int d = 0; d < d_model; d++) {
+            x.data[d] += pe->table->data[(size_t)pos * d_model + d];
+        }
+    }
+
+    /* === Per-layer Pre-LN forward. === */
+    for (int i = 0; i < t->decoder->num_layers; i++) {
+        DecoderLayer *layer = &t->decoder->layers[i];
+        DecoderLayerKV *kv = &cache->layers[i];
+
+        /* ----- LN1 + self-attn (incremental). ----- */
+        Tensor3D ln1 = tensor_clone(&x);
+        tensor_layer_norm_inplace(&ln1, layer->ln1_gamma, layer->ln1_beta, 1e-5f);
+
+        /* Project the new token through this layer's self-attn Wq/Wk/Wv. */
+        Tensor3D q1 = tensor_create(1, 1, d_model);
+        tensor_linear_forward(&ln1, layer->self_attn->Wq, &q1);
+
+        /* Append k_new / v_new to the layer's self-attn cache. */
+        Tensor3D k_new = {.batch_size = 1, .seq_len = 1, .d_model = d_model,
+                          .data = kv->self_k + (size_t)pos * d_model};
+        Tensor3D v_new = {.batch_size = 1, .seq_len = 1, .d_model = d_model,
+                          .data = kv->self_v + (size_t)pos * d_model};
+        tensor_linear_forward(&ln1, layer->self_attn->Wk, &k_new);
+        tensor_linear_forward(&ln1, layer->self_attn->Wv, &v_new);
+        tensor_free(&ln1);
+
+        Tensor3D self_out = attn_step_compute(layer->self_attn,
+                                              q1.data, kv->self_k, kv->self_v,
+                                              pos + 1);
+        tensor_free(&q1);
+
+        /* y1 = x + self_attn_out */
+        Tensor3D y1 = tensor_clone(&x);
+        for (int d = 0; d < d_model; d++) y1.data[d] += self_out.data[d];
+        tensor_free(&self_out);
+
+        /* ----- LN2 + cross-attn (K/V already cached). ----- */
+        Tensor3D ln2 = tensor_clone(&y1);
+        tensor_layer_norm_inplace(&ln2, layer->ln2_gamma, layer->ln2_beta, 1e-5f);
+
+        Tensor3D q2 = tensor_create(1, 1, d_model);
+        tensor_linear_forward(&ln2, layer->cross_attn->Wq, &q2);
+        tensor_free(&ln2);
+
+        Tensor3D cross_out = attn_step_compute(layer->cross_attn,
+                                               q2.data, kv->cross_k, kv->cross_v,
+                                               cache->src_len);
+        tensor_free(&q2);
+
+        /* y2 = y1 + cross_out */
+        Tensor3D y2 = y1;
+        for (int d = 0; d < d_model; d++) y2.data[d] += cross_out.data[d];
+        tensor_free(&cross_out);
+
+        /* ----- LN3 + FFN. ----- */
+        Tensor3D ln3 = tensor_clone(&y2);
+        tensor_layer_norm_inplace(&ln3, layer->ln3_gamma, layer->ln3_beta, 1e-5f);
+        Tensor3D ff = feed_forward_forward(layer->ffn, &ln3, NULL);
+        tensor_free(&ln3);
+
+        /* x = y2 + FFN_out */
+        for (int d = 0; d < d_model; d++) y2.data[d] += ff.data[d];
+        tensor_free(&ff);
+
+        tensor_free(&x);
+        x = y2;
+    }
+    cache->cur_len = pos + 1;
+
+    /* === Logit head: x @ logit_head -> (1, 1, vocab_size) === */
+    Tensor3D logits = tensor_create(1, 1, vocab_size);
+    tensor_linear_forward(&x, t->logit_head, &logits);
+    tensor_free(&x);
+    return logits;
 }
 
 void transformer_cache_free(TransformerCache *cache, int encoder_layers, int decoder_layers) {
@@ -1258,8 +1756,16 @@ TrainingState *training_state_create(Transformer *model, float lr, float beta1, 
         register_param(ts, l->ln3_beta);
     }
 
-    register_param(ts, model->input_projection);
-    register_param(ts, model->output_projection);
+    if (model->config.vocab_size > 0 && model->token_embedding && model->logit_head) {
+        /* LM mode: train the embedding table and the logit head; the legacy
+         * d_model-space projections stay at their (random) init since the LM
+         * forward path does not use them. */
+        register_param(ts, model->token_embedding);
+        register_param(ts, model->logit_head);
+    } else {
+        register_param(ts, model->input_projection);
+        register_param(ts, model->output_projection);
+    }
     return ts;
 }
 
@@ -1401,8 +1907,13 @@ int trainer_save(Trainer *trainer, const char *filename) {
         WRITE_MAT(l->ln3_beta);
     }
 
-    WRITE_MAT(t->input_projection);
-    WRITE_MAT(t->output_projection);
+    if (t->config.vocab_size > 0 && t->token_embedding && t->logit_head) {
+        WRITE_MAT(t->token_embedding);
+        WRITE_MAT(t->logit_head);
+    } else {
+        WRITE_MAT(t->input_projection);
+        WRITE_MAT(t->output_projection);
+    }
 
     fclose(f);
     return 0;
@@ -1462,8 +1973,13 @@ Trainer trainer_load(const char *filename) {
         READ_MAT(l->ln3_beta);
     }
 
-    READ_MAT(t->input_projection);
-    READ_MAT(t->output_projection);
+    if (t->config.vocab_size > 0 && t->token_embedding && t->logit_head) {
+        READ_MAT(t->token_embedding);
+        READ_MAT(t->logit_head);
+    } else {
+        READ_MAT(t->input_projection);
+        READ_MAT(t->output_projection);
+    }
 
     fclose(f);
     return trainer;

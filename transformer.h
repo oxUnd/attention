@@ -19,6 +19,16 @@ typedef struct {
     int max_len;
     double dropout;
     ActivationKind activation;
+    /* When > 0 the model is in language-model mode: an explicit token
+     * embedding table (vocab_size, d_model) and a logit head
+     * (vocab_size, d_model) are allocated, and the legacy d_model-space
+     * input/output projections are NOT registered for training. Forward
+     * pass goes through transformer_forward_lm / transformer_backward_lm.
+     *
+     * When == 0 (default) the legacy d_model in / d_model out path is used
+     * via transformer_forward / transformer_backward, preserving binary
+     * compatibility with existing demos (train_simple, train_full, ...). */
+    int vocab_size;
 } TransformerConfig;
 
 /* Multi-head self/cross attention.
@@ -101,8 +111,14 @@ typedef struct {
     TransformerConfig config;
     Encoder *encoder;
     Decoder *decoder;
+    /* Legacy d_model-space projections (used when config.vocab_size == 0). */
     Matrix *input_projection;
     Matrix *output_projection;
+    /* LM mode (config.vocab_size > 0): token embedding table and logit head.
+     * Both have shape (vocab_size, d_model); embedding lookup picks a row,
+     * the logit head is applied as logits = decoder_out @ logit_head^T. */
+    Matrix *token_embedding;
+    Matrix *logit_head;
 } Transformer;
 
 /* =========================================================================
@@ -227,6 +243,84 @@ Tensor3D transformer_forward(Transformer *t, Tensor3D *src, Tensor3D *tgt,
 void transformer_backward(Transformer *t, TransformerCache *cache,
                           Tensor3D *grad, Tensor3D *tgt, TrainingState *ts);
 void transformer_cache_free(TransformerCache *cache, int encoder_layers, int decoder_layers);
+
+/* =========================================================================
+ * Language-model forward/backward (token-id input, vocab logits output).
+ *
+ * Required: config.vocab_size > 0 (i.e. token_embedding / logit_head allocated).
+ *
+ * src_ids, tgt_ids: row-major arrays of shape (batch_size * src_len) and
+ * (batch_size * tgt_len) respectively. Token IDs must be in [0, vocab_size).
+ *
+ * Output logits have shape (batch_size, tgt_len, vocab_size).
+ *
+ * The cache holds enough state to backprop through both the embedding
+ * lookup and the logit head; the caller is responsible for keeping the
+ * src_ids/tgt_ids arrays alive until backward returns.
+ * ========================================================================= */
+Tensor3D transformer_forward_lm(Transformer *t,
+                                const int *src_ids, int src_len,
+                                const int *tgt_ids, int tgt_len,
+                                int batch_size,
+                                Tensor3D *src_mask, Tensor3D *tgt_mask,
+                                TransformerCache *cache);
+
+void transformer_backward_lm(Transformer *t, TransformerCache *cache,
+                             Tensor3D *grad_logits,
+                             const int *src_ids, const int *tgt_ids,
+                             TrainingState *ts);
+
+/* =========================================================================
+ * Incremental decoding with a per-layer KV cache.
+ *
+ * Workflow:
+ *   1) cache = transformer_kv_cache_create(model, max_decode_len);
+ *   2) transformer_lm_init_cache(model, src_ids, src_len, cache);
+ *      - runs the encoder once
+ *      - pre-projects encoder_out through every decoder layer's cross-attn
+ *        Wk/Wv so the cross-attention K/V are reusable for the rest of the
+ *        generation
+ *   3) repeatedly call:
+ *      logits = transformer_lm_step(model, next_token_id, cache);
+ *      The cache appends fresh self-attn K/V on every call. cache->cur_len
+ *      tracks how many tgt tokens have been pushed so far (also drives
+ *      positional encoding offsets).
+ *   4) transformer_kv_cache_free(cache);
+ *
+ * Only batch_size == 1 is supported by the cached path (we don't currently
+ * generate in batched mode). The cache is purely an inference optimisation;
+ * gradients never flow through it.
+ * ========================================================================= */
+typedef struct {
+    /* Self-attn history per decoder layer, projected through Wk / Wv but
+     * still in flat (cache_len, d_model) layout (split_heads is done on the
+     * fly each step). Buffers are sized for max_len entries. */
+    float *self_k;
+    float *self_v;
+    /* Cross-attn K / V, projected once from encoder_out and reused. */
+    float *cross_k;
+    float *cross_v;
+} DecoderLayerKV;
+
+typedef struct {
+    int num_layers;
+    int d_model;
+    int max_len;        /* allocated capacity for self-attn cache */
+    int cur_len;        /* tokens already pushed via lm_step */
+    int src_len;        /* fixed once init_cache runs */
+    DecoderLayerKV *layers;
+} TransformerKVCache;
+
+TransformerKVCache *transformer_kv_cache_create(const Transformer *t, int max_len);
+void transformer_kv_cache_free(TransformerKVCache *cache);
+/* Resets cur_len=0; cross-attn K/V are recomputed for the new src. */
+void transformer_lm_init_cache(Transformer *t,
+                               const int *src_ids, int src_len,
+                               TransformerKVCache *cache);
+/* Returns logits of shape (1, 1, vocab_size). Caller owns the buffer and
+ * must tensor_free it. */
+Tensor3D transformer_lm_step(Transformer *t, int next_token,
+                             TransformerKVCache *cache);
 
 /* =========================================================================
  * Training state API
