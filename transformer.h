@@ -191,6 +191,8 @@ void tensor_zero(Tensor3D *t);
 Tensor3D tensor_create(int batch_size, int seq_len, int d_model);
 void tensor_free(Tensor3D *t);
 Tensor3D clone_tensor(Tensor3D *t);
+Tensor3D causal_mask_create(int seq_len);
+Tensor3D padding_mask_create(int batch_size, int seq_len, const int *valid_lens);
 void tensor_softmax(Tensor3D *t, int axis);
 void tensor_layer_norm(Tensor3D *x, Matrix *gamma, Matrix *beta, float eps);
 void tensor_dropout(Tensor3D *t, float dropout_prob, int training);

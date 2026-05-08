@@ -1,6 +1,7 @@
 #ifndef TEXT_LM_H
 #define TEXT_LM_H
 
+#include "tokenizer.h"
 #include "transformer.h"
 #include <stdio.h>
 
@@ -23,11 +24,13 @@ typedef struct {
     int early_stop_patience;
     float learning_rate;
     float dropout;
+    int vocab_size;
 } TextLmHyperparams;
 
 extern const TextLmHyperparams text_lm_default_hyperparams;
 
 int text_corpus_from_text(const char *text, TextCorpus *out);
+int text_corpus_from_text_with_tokenizer(const char *text, const Tokenizer *tok, TextCorpus *out);
 void text_corpus_free(TextCorpus *c);
 
 int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transformer **model_out,
@@ -36,6 +39,10 @@ void text_lm_free_session(Transformer *model, TrainingState *ts);
 
 void text_lm_generate(Transformer *model, const TextLmHyperparams *hp, const char *seed, int length,
                       float temperature, FILE *out);
+
+void text_lm_generate_with_tokenizer(Transformer *model, const TextLmHyperparams *hp,
+                                     const Tokenizer *tok, const char *seed, int length,
+                                     float temperature, FILE *out);
 
 int text_lm_save(Transformer *model, TrainingState *ts, float lr, const char *path);
 int text_lm_load(const char *path, Transformer **model_out, TrainingState **ts_out);

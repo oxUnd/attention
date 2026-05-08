@@ -90,14 +90,14 @@ void matrix_zero(Matrix *m) {
 
 void matrix_rand(Matrix *m) {
     for (int i = 0; i < m->rows * m->cols; i++) {
-        m->data[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+        m->data[i] = ((float)rand() / (float)RAND_MAX - 0.5f) * 0.1f;
     }
 }
 
 void matrix_xavier(Matrix *m) {
     float scale = sqrtf(2.0f / (m->rows + m->cols));
     for (int i = 0; i < m->rows * m->cols; i++) {
-        m->data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
+        m->data[i] = ((float)rand() / (float)RAND_MAX * 2.0f - 1.0f) * scale;
     }
 }
 
@@ -159,7 +159,7 @@ void tensor_dropout(Tensor3D *t, float dropout_prob, int training) {
     float scale = 1.0f / (1.0f - dropout_prob);
     int size = t->batch_size * t->seq_len * t->d_model;
     for (int i = 0; i < size; i++) {
-        if ((float)rand() / RAND_MAX < dropout_prob) {
+        if ((float)rand() / (float)RAND_MAX < dropout_prob) {
             t->data[i] = 0;
         } else {
             t->data[i] *= scale;
@@ -172,7 +172,7 @@ void matrix_dropout(Matrix *m, int rows, int cols, float dropout_prob, int train
     float scale = 1.0f / (1.0f - dropout_prob);
     int size = rows * cols;
     for (int i = 0; i < size; i++) {
-        if ((float)rand() / RAND_MAX < dropout_prob) {
+        if ((float)rand() / (float)RAND_MAX < dropout_prob) {
             m->data[i] = 0;
         } else {
             m->data[i] *= scale;
@@ -329,11 +329,23 @@ Tensor3D multi_head_attn_forward(
     }
 
     if (attn_mask && attn_mask->data) {
+        int mb = attn_mask->batch_size;
+        int ms = attn_mask->seq_len;
+        int md = attn_mask->d_model;
+        int has_query_dim = (ms == s && md == s);
+        int has_padding_only = (!has_query_dim && md == s);
         for (int i = 0; i < b; i++) {
+            int bi = (mb == 1) ? 0 : i;
             for (int h = 0; h < nhead; h++) {
                 for (int j = 0; j < s; j++) {
                     for (int t = 0; t < s; t++) {
-                        if (attn_mask->data[i * s + t] == 0) {
+                        float mv = 1.0f;
+                        if (has_query_dim) {
+                            mv = attn_mask->data[bi * s * s + j * s + t];
+                        } else if (has_padding_only) {
+                            mv = attn_mask->data[bi * s + t];
+                        }
+                        if (mv == 0.0f) {
                             scores.data[i * nhead * s * s + h * s * s + j * s + t] = -1e9f;
                         }
                     }
@@ -571,6 +583,27 @@ Tensor3D clone_tensor(Tensor3D *t) {
     Tensor3D c = tensor_create(t->batch_size, t->seq_len, t->d_model);
     memcpy(c.data, t->data, t->batch_size * t->seq_len * t->d_model * sizeof(float));
     return c;
+}
+
+Tensor3D causal_mask_create(int seq_len) {
+    Tensor3D m = tensor_create(1, seq_len, seq_len);
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < seq_len; j++) {
+            m.data[i * seq_len + j] = (j <= i) ? 1.0f : 0.0f;
+        }
+    }
+    return m;
+}
+
+Tensor3D padding_mask_create(int batch_size, int seq_len, const int *valid_lens) {
+    Tensor3D m = tensor_create(batch_size, 1, seq_len);
+    for (int b = 0; b < batch_size; b++) {
+        int vl = valid_lens ? valid_lens[b] : seq_len;
+        for (int t = 0; t < seq_len; t++) {
+            m.data[b * seq_len + t] = (t < vl) ? 1.0f : 0.0f;
+        }
+    }
+    return m;
 }
 
 Tensor3D encoder_layer_forward(

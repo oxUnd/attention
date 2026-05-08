@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c99
-SRC = transformer.c main.c text_lm.c train_copy_task.c train_simple.c train_full.c train_text.c
+SRC = transformer.c main.c text_lm.c tokenizer.c train_copy_task.c train_simple.c train_full.c train_text.c
 OBJ = $(SRC:.c=.o)
 TARGET = transformer
 TRAIN_TARGET = train_copy_task
@@ -10,7 +10,7 @@ TEXT_TARGET = train_text
 
 all: $(TARGET) $(TRAIN_TARGET) $(SIMPLE_TARGET) $(FULL_TARGET) $(TEXT_TARGET)
 
-$(TARGET): transformer.o main.o text_lm.o
+$(TARGET): transformer.o main.o text_lm.o tokenizer.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(TRAIN_TARGET): transformer.o train_copy_task.o
@@ -22,18 +22,22 @@ $(SIMPLE_TARGET): transformer.o train_simple.o
 $(FULL_TARGET): transformer.o train_full.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-$(TEXT_TARGET): transformer.o train_text.o text_lm.o
+$(TEXT_TARGET): transformer.o train_text.o text_lm.o tokenizer.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 %.o: %.c transformer.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-main.o: main.c text_lm.h transformer.h
-text_lm.o: text_lm.c text_lm.h transformer.h
-train_text.o: train_text.c text_lm.h transformer.h
+main.o: main.c text_lm.h tokenizer.h transformer.h
+text_lm.o: text_lm.c text_lm.h tokenizer.h transformer.h
+tokenizer.o: tokenizer.c tokenizer.h
+train_text.o: train_text.c text_lm.h tokenizer.h transformer.h
 
 train: $(FULL_TARGET)
 	./$(FULL_TARGET)
+
+text: $(TEXT_TARGET)
+	./$(TEXT_TARGET)
 
 test: $(TARGET)
 	./$(TARGET) --help
@@ -41,4 +45,4 @@ test: $(TARGET)
 clean:
 	rm -f $(OBJ) $(TARGET) $(TRAIN_TARGET) $(SIMPLE_TARGET) $(FULL_TARGET) $(TEXT_TARGET)
 
-.PHONY: all clean test train
+.PHONY: all clean test train text
