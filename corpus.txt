@@ -1,0 +1,19 @@
+the cat sees the dog. the dog sees the cat. the cat sees the bird. the bird sees the cat.
+the dog sees the bird. the bird sees the dog. the cat sees the fish. the fish sees the cat.
+the dog sees the fish. the fish sees the dog. the bird sees the fish. the fish sees the bird.
+the cat is happy. the dog is happy. the bird is happy. the fish is happy.
+the cat is sad. the dog is sad. the bird is sad. the fish is sad.
+the cat is small. the dog is big. the bird is small. the fish is small.
+the cat is a friend. the dog is a friend. the bird is a friend. the fish is a friend.
+a small cat sees a big dog. a big dog sees a small cat. a small bird sees a big fish.
+a big fish sees a small bird. a happy cat sees a sad dog. a sad dog sees a happy cat.
+the friend sees the cat. the friend sees the dog. the friend sees the bird. the friend sees the fish.
+the cat sees a friend. the dog sees a friend. the bird sees a friend. the fish sees a friend.
+a friend is happy. a friend is sad. a friend is small. a friend is big.
+the cat and the dog are friends. the bird and the fish are friends.
+the cat and the bird are friends. the dog and the fish are friends.
+the small cat is a friend. the big dog is a friend. the small bird is a friend.
+the happy cat sees the happy dog. the sad bird sees the sad fish.
+the cat is here. the dog is there. the bird is here. the fish is there.
+a cat is a friend. a dog is a friend. a bird is a friend. a fish is a friend.
+the cat sees the cat. the dog sees the dog. the bird sees the bird. the fish sees the fish.
