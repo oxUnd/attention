@@ -21,6 +21,7 @@ const TextLmHyperparams text_lm_default_hyperparams = {
     .learning_rate = 0.0008f,
     .dropout = 0.0f,
     .vocab_size = TEXT_LM_VOCAB_SIZE,
+    .best_checkpoint_path = NULL,
 };
 
 const char *text_lm_vocab_chars(void) { return LM_CHARS; }
@@ -385,6 +386,13 @@ int text_lm_train(const TextCorpus *corpus, const TextLmHyperparams *hp, Transfo
         if (avg_loss < best_avg_loss - 0.002f) {
             best_avg_loss = avg_loss;
             patience = 0;
+            if (hp->best_checkpoint_path) {
+                if (text_lm_save(model, ts, hp->learning_rate, hp->best_checkpoint_path) != 0) {
+                    fprintf(stderr,
+                            "Warning: failed to write best checkpoint to %s at epoch %d\n",
+                            hp->best_checkpoint_path, epoch);
+                }
+            }
         } else {
             patience++;
         }

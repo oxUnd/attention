@@ -25,6 +25,11 @@ typedef struct {
     float learning_rate;
     float dropout;
     int vocab_size;
+    /* Optional: when non-NULL, the trainer dumps the model+ts to this path
+     * every time avg_loss reaches a new best. After training finishes, the
+     * file therefore reflects the best-loss checkpoint (not the final epoch).
+     * Leave NULL to disable auto-saving (legacy behaviour). */
+    const char *best_checkpoint_path;
 } TextLmHyperparams;
 
 extern const TextLmHyperparams text_lm_default_hyperparams;

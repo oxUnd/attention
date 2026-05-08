@@ -195,6 +195,8 @@ int main(int argc, char **argv) {
         if (a.dec_layers > 0) hp.decoder_layers = a.dec_layers;
         hp.vocab_size = tok->vocab_size;
 
+        if (a.out_path) hp.best_checkpoint_path = a.out_path;
+
         if (hp.vocab_size > hp.d_model) {
             fprintf(stderr,
                     "vocab_size (%d) > d_model (%d). Increase --d-model or shrink --vocab-size.\n",
@@ -225,16 +227,13 @@ int main(int argc, char **argv) {
         printf("\n=== Training complete ===\n");
 
         if (a.out_path) {
-            if (text_lm_save(model, ts, hp.learning_rate, a.out_path) != 0) {
-                fprintf(stderr, "Failed to write model file: %s\n", a.out_path);
-                text_lm_free_session(model, ts);
-                tokenizer_free(tok);
-                return 1;
-            }
+            /* Model weights are auto-saved during training every time avg_loss
+             * reaches a new best (see hp.best_checkpoint_path). Here we only
+             * need to persist the tokenizer alongside that best checkpoint. */
             char tok_path[1024];
             make_tok_path(a.out_path, tok_path, sizeof(tok_path));
             tokenizer_save(tok, tok_path);
-            printf("Saved checkpoint: %s (vocab: %s)\n", a.out_path, tok_path);
+            printf("Best checkpoint kept at: %s (vocab: %s)\n", a.out_path, tok_path);
         } else {
             fprintf(stderr, "Note: no --out path; weights and tokenizer not saved.\n");
         }
