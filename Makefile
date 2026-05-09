@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c99
-SRC = nn_math.c transformer.c main.c text_lm.c tokenizer.c train_copy_task.c train_simple.c train_full.c train_text.c train_translate.c
+SRC = nn_math.c transformer.c main.c text_lm.c tokenizer.c train_copy_task.c train_simple.c train_full.c train_text.c train_translate.c visualize.c
 OBJ = $(SRC:.c=.o)
 TARGET = transformer
 TRAIN_TARGET = train_copy_task
@@ -8,8 +8,9 @@ SIMPLE_TARGET = train_simple
 FULL_TARGET = train_full
 TEXT_TARGET = train_text
 TRANSLATE_TARGET = train_translate
+VISUALIZE_TARGET = visualize
 
-all: $(TARGET) $(TRAIN_TARGET) $(SIMPLE_TARGET) $(FULL_TARGET) $(TEXT_TARGET) $(TRANSLATE_TARGET)
+all: $(TARGET) $(TRAIN_TARGET) $(SIMPLE_TARGET) $(FULL_TARGET) $(TEXT_TARGET) $(TRANSLATE_TARGET) $(VISUALIZE_TARGET)
 
 $(TARGET): nn_math.o transformer.o main.o text_lm.o tokenizer.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
@@ -29,6 +30,9 @@ $(TEXT_TARGET): nn_math.o transformer.o train_text.o text_lm.o tokenizer.o
 $(TRANSLATE_TARGET): nn_math.o transformer.o train_translate.o text_lm.o tokenizer.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+$(VISUALIZE_TARGET): nn_math.o transformer.o visualize.o text_lm.o tokenizer.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
 %.o: %.c nn_math.h transformer.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -39,6 +43,7 @@ text_lm.o: text_lm.c text_lm.h tokenizer.h transformer.h nn_math.h
 tokenizer.o: tokenizer.c tokenizer.h
 train_text.o: train_text.c text_lm.h tokenizer.h transformer.h nn_math.h
 train_translate.o: train_translate.c transformer.h tokenizer.h nn_math.h
+visualize.o: visualize.c text_lm.h tokenizer.h transformer.h nn_math.h
 
 train: $(FULL_TARGET)
 	./$(FULL_TARGET)
@@ -53,6 +58,6 @@ test: $(TARGET)
 	./$(TARGET) --help
 
 clean:
-	rm -f $(OBJ) $(TARGET) $(TRAIN_TARGET) $(SIMPLE_TARGET) $(FULL_TARGET) $(TEXT_TARGET) $(TRANSLATE_TARGET)
+	rm -f $(OBJ) $(TARGET) $(TRAIN_TARGET) $(SIMPLE_TARGET) $(FULL_TARGET) $(TEXT_TARGET) $(TRANSLATE_TARGET) $(VISUALIZE_TARGET)
 
 .PHONY: all clean test train text translate
