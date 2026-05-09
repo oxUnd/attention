@@ -7,6 +7,7 @@ typedef enum {
     TOKENIZER_CHAR = 0,
     TOKENIZER_BYTE = 1,
     TOKENIZER_WORD = 2,
+    TOKENIZER_UTF8 = 3,
 } TokenizerKind;
 
 #define TOK_PAD 0
@@ -35,6 +36,10 @@ typedef struct {
 Tokenizer *tokenizer_create_char(const char *charset, int lowercase);
 Tokenizer *tokenizer_create_byte(void);
 Tokenizer *tokenizer_create_word(const char *corpus, int max_vocab, int lowercase);
+/* UTF-8 char-level tokenizer: every Unicode codepoint (Chinese characters
+ * included) is a single token; the vocabulary is built from the codepoint
+ * frequencies in `corpus`. `lowercase` only folds ASCII letters. */
+Tokenizer *tokenizer_create_utf8(const char *corpus, int max_vocab, int lowercase);
 void tokenizer_free(Tokenizer *t);
 
 int tokenizer_encode(const Tokenizer *t, const char *text, int *out, int max_out);

@@ -50,8 +50,8 @@ static int load_translation_corpus(const Tokenizer *tok, TranslationCorpus *out)
         const char *en = PAIRS[i];
         const char *zh = PAIRS[i + 1];
 
-        int en_cap = strlen(en) + 8;
-        int zh_cap = strlen(zh) + 8;
+        int en_cap = (int)strlen(en) + 8;
+        int zh_cap = (int)strlen(zh) + 8;
 
         out->pairs[idx].en_ids = (int *)malloc(en_cap * sizeof(int));
         out->pairs[idx].zh_ids = (int *)malloc(zh_cap * sizeof(int));
@@ -82,6 +82,25 @@ static void free_translation_corpus(TranslationCorpus *c) {
     c->num_pairs = 0;
 }
 
+/* Concatenate every string in PAIRS (both English and Chinese) into a single
+ * corpus buffer, used to build the utf8 tokenizer's vocabulary. The caller
+ * owns the returned pointer and must free it. */
+static char *build_pairs_corpus_string(void) {
+    size_t total = 1;
+    for (int i = 0; PAIRS[i]; i++) total += strlen(PAIRS[i]) + 1;
+    char *buf = (char *)malloc(total);
+    if (!buf) return NULL;
+    size_t pos = 0;
+    for (int i = 0; PAIRS[i]; i++) {
+        size_t L = strlen(PAIRS[i]);
+        memcpy(buf + pos, PAIRS[i], L);
+        pos += L;
+        buf[pos++] = ' ';
+    }
+    buf[pos] = 0;
+    return buf;
+}
+
 typedef struct {
     int seq_len;
     int batch_size;
@@ -93,7 +112,9 @@ typedef struct {
     int max_epochs;
     float learning_rate;
     float dropout;
-    int vocab_size;
+    int vocab_size;        /* 0 means: use tokenizer's vocab_size */
+    int log_every;
+    float convergence_loss;
 } TranslateHyperparams;
 
 static const TranslateHyperparams default_translate_hp = {
@@ -107,14 +128,24 @@ static const TranslateHyperparams default_translate_hp = {
     .max_epochs = 500,
     .learning_rate = 0.005f,
     .dropout = 0.0f,
-    .vocab_size = 260
+    .vocab_size = 0,
+    .log_every = 20,
+    .convergence_loss = 0.05f,
 };
+
+/* Fisher-Yates shuffle on a pre-allocated buffer. */
+static void shuffle_indices(int *order, int n) {
+    for (int i = n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+}
 
 static int translate_train(const TranslationCorpus *corpus, const TranslateHyperparams *hp,
                            Transformer **model_out, TrainingState **ts_out) {
-    int seq_len = hp->seq_len;
-    int batch_size = hp->batch_size;
-    int vocab_size = hp->vocab_size;
+    const int seq_len = hp->seq_len;
+    const int batch_size = hp->batch_size;
+    const int vocab_size = hp->vocab_size;
 
     TransformerConfig config = {
         .d_model = hp->d_model,
@@ -136,13 +167,17 @@ static int translate_train(const TranslationCorpus *corpus, const TranslateHyper
         return -1;
     }
 
+    /* Pre-allocate every per-batch buffer once. */
     Tensor3D causal = mask_causal_create(seq_len);
-    int *src_ids = (int *)malloc(batch_size * seq_len * sizeof(int));
-    int *tgt_ids = (int *)malloc(batch_size * seq_len * sizeof(int));
-    int *targets = (int *)malloc(batch_size * seq_len * sizeof(int));
+    int *src_ids = (int *)malloc((size_t)batch_size * seq_len * sizeof(int));
+    int *tgt_ids = (int *)malloc((size_t)batch_size * seq_len * sizeof(int));
+    int *targets = (int *)malloc((size_t)batch_size * seq_len * sizeof(int));
+    int *src_valid_lens = (int *)malloc((size_t)batch_size * sizeof(int));
+    int *order = (int *)malloc((size_t)corpus->num_pairs * sizeof(int));
 
-    if (!src_ids || !tgt_ids || !targets) {
+    if (!src_ids || !tgt_ids || !targets || !src_valid_lens || !order) {
         free(src_ids); free(tgt_ids); free(targets);
+        free(src_valid_lens); free(order);
         tensor_free(&causal);
         training_state_free(ts);
         transformer_free(model);
@@ -152,37 +187,44 @@ static int translate_train(const TranslationCorpus *corpus, const TranslateHyper
     printf("Training: %d pairs, seq_len=%d, batch=%d, vocab=%d\n\n",
            corpus->num_pairs, seq_len, batch_size, vocab_size);
 
+    clock_t total_t0 = clock();
+
     for (int epoch = 0; epoch < hp->max_epochs; epoch++) {
+        clock_t epoch_t0 = clock();
         float sum_loss = 0.0f;
-
-        int *order = (int *)malloc(corpus->num_pairs * sizeof(int));
-        for (int i = 0; i < corpus->num_pairs; i++) order[i] = i;
-        for (int i = corpus->num_pairs - 1; i > 0; i--) {
-            int j = rand() % (i + 1);
-            int t = order[i]; order[i] = order[j]; order[j] = t;
-        }
-
         int num_batches = 0;
+
+        for (int i = 0; i < corpus->num_pairs; i++) order[i] = i;
+        shuffle_indices(order, corpus->num_pairs);
+
         for (int b = 0; b < corpus->num_pairs; b += batch_size) {
             int cur_batch = (corpus->num_pairs - b < batch_size) ?
-                           corpus->num_pairs - b : batch_size;
+                            corpus->num_pairs - b : batch_size;
 
             for (int i = 0; i < cur_batch; i++) {
                 const TranslationPair *pair = &corpus->pairs[order[b + i]];
+                int en_clip = pair->en_len < seq_len ? pair->en_len : seq_len;
+                src_valid_lens[i] = en_clip;
+
+                int *src_row = src_ids + i * seq_len;
+                int *tgt_row = tgt_ids + i * seq_len;
+                int *out_row = targets + i * seq_len;
+
                 for (int s = 0; s < seq_len; s++) {
-                    src_ids[i * seq_len + s] = (s < pair->en_len) ? pair->en_ids[s] : TOK_PAD;
-                    if (s == 0) {
-                        tgt_ids[i * seq_len + s] = TOK_BOS;
-                        targets[i * seq_len + s] = (0 < pair->zh_len) ? pair->zh_ids[0] : TOK_EOS;
-                    } else if (s - 1 < pair->zh_len) {
-                        tgt_ids[i * seq_len + s] = pair->zh_ids[s - 1];
-                        targets[i * seq_len + s] = (s < pair->zh_len) ? pair->zh_ids[s] : TOK_EOS;
-                    } else {
-                        tgt_ids[i * seq_len + s] = TOK_PAD;
-                        targets[i * seq_len + s] = TOK_EOS;
-                    }
+                    src_row[s] = (s < en_clip) ? pair->en_ids[s] : TOK_PAD;
+                }
+
+                tgt_row[0] = TOK_BOS;
+                out_row[0] = (pair->zh_len > 0) ? pair->zh_ids[0] : TOK_EOS;
+                for (int s = 1; s < seq_len; s++) {
+                    int prev = s - 1;
+                    tgt_row[s] = (prev < pair->zh_len) ? pair->zh_ids[prev] : TOK_PAD;
+                    out_row[s] = (s   < pair->zh_len) ? pair->zh_ids[s]   : TOK_EOS;
                 }
             }
+
+            /* Padding mask for the encoder so cross-attn ignores <pad>. */
+            Tensor3D src_mask = mask_padding_create(cur_batch, seq_len, src_valid_lens);
 
             training_state_zero_grads(ts);
 
@@ -191,7 +233,7 @@ static int translate_train(const TranslationCorpus *corpus, const TranslateHyper
                                                      src_ids, seq_len,
                                                      tgt_ids, seq_len,
                                                      cur_batch,
-                                                     NULL, &causal, &cache);
+                                                     &src_mask, &causal, &cache);
 
             LossResult loss = cross_entropy_loss(&output, targets, vocab_size);
 
@@ -205,24 +247,29 @@ static int translate_train(const TranslationCorpus *corpus, const TranslateHyper
             transformer_cache_free(&cache, config.encoder_layers, config.decoder_layers);
             tensor_free(&output);
             tensor_free(&loss.grad);
+            tensor_free(&src_mask);
         }
-
-        free(order);
 
         float avg_loss = sum_loss / (float)num_batches;
-        if (epoch % 20 == 0 || epoch == hp->max_epochs - 1 || avg_loss < 0.5f) {
-            printf("Epoch %4d: loss=%.4f\n", epoch, avg_loss);
+        int converged = avg_loss < hp->convergence_loss;
+        if (epoch % hp->log_every == 0 || epoch == hp->max_epochs - 1 || converged) {
+            double dt = (double)(clock() - epoch_t0) / CLOCKS_PER_SEC;
+            printf("Epoch %4d: loss=%.4f  (%.2fs)\n", epoch, avg_loss, dt);
         }
-
-        if (avg_loss < 0.3f) {
+        if (converged) {
             printf("Converged at epoch %d: loss=%.4f\n", epoch, avg_loss);
             break;
         }
     }
 
+    double total_dt = (double)(clock() - total_t0) / CLOCKS_PER_SEC;
+    printf("Total training time: %.2fs\n", total_dt);
+
     free(src_ids);
     free(tgt_ids);
     free(targets);
+    free(src_valid_lens);
+    free(order);
     tensor_free(&causal);
 
     *model_out = model;
@@ -230,96 +277,95 @@ static int translate_train(const TranslationCorpus *corpus, const TranslateHyper
     return 0;
 }
 
-static int sample_logits(const float *logits, int size, float temperature) {
+/* Sample with temperature. probs_buf must hold at least `size` floats. */
+static int sample_logits(const float *logits, int size, float temperature, float *probs_buf) {
     if (temperature < 1e-4f) temperature = 1e-4f;
     float max_val = logits[0];
     for (int i = 1; i < size; i++) {
         if (logits[i] > max_val) max_val = logits[i];
     }
-    float *probs = (float *)malloc((size_t)size * sizeof(float));
     float sum = 0.0f;
     for (int i = 0; i < size; i++) {
-        probs[i] = expf((logits[i] - max_val) / temperature);
-        sum += probs[i];
+        probs_buf[i] = expf((logits[i] - max_val) / temperature);
+        sum += probs_buf[i];
     }
     float r = (float)rand() / (float)RAND_MAX;
     float cumsum = 0.0f;
-    int chosen = size - 1;
+    float inv_sum = 1.0f / sum;
     for (int i = 0; i < size; i++) {
-        cumsum += probs[i] / sum;
-        if (cumsum >= r) { chosen = i; break; }
+        cumsum += probs_buf[i] * inv_sum;
+        if (cumsum >= r) return i;
     }
-    free(probs);
-    return chosen;
+    return size - 1;
 }
 
+/* Incremental, KV-cached generation. Each step is O(1) wrt past tokens. */
 static void translate_generate(Transformer *model, const TranslateHyperparams *hp,
-                                const Tokenizer *tok,
-                                const char *en_text, int max_len, float temperature) {
-    int seq_len = hp->seq_len;
-    int vocab_size = hp->vocab_size;
+                               const Tokenizer *tok,
+                               const char *en_text, int max_len, float temperature) {
+    const int vocab_size = hp->vocab_size;
+    const int seq_len    = hp->seq_len;
 
-    int src_cap = strlen(en_text) + 8;
-    int *src_raw = (int *)malloc(src_cap * sizeof(int));
-    int src_len_raw = tokenizer_encode(tok, en_text, src_raw, src_cap);
-    if (src_len_raw <= 0) {
-        free(src_raw);
+    int src_cap = (int)strlen(en_text) + 8;
+    int *src_ids = (int *)malloc((size_t)src_cap * sizeof(int));
+    int src_len = tokenizer_encode(tok, en_text, src_ids, src_cap);
+    if (src_len <= 0) {
+        free(src_ids);
+        return;
+    }
+    if (src_len > seq_len) src_len = seq_len;
+
+    int *tgt_buf = (int *)malloc((size_t)(max_len + 2) * sizeof(int));
+    float *probs_buf = (float *)malloc((size_t)vocab_size * sizeof(float));
+    int decode_cap = max_len + 4;
+    TransformerKVCache *kv = transformer_kv_cache_create(model, decode_cap);
+    if (!tgt_buf || !probs_buf || !kv) {
+        free(src_ids); free(tgt_buf); free(probs_buf);
+        if (kv) transformer_kv_cache_free(kv);
         return;
     }
 
-    int *tgt_buf = (int *)malloc((size_t)(max_len + 2) * sizeof(int));
-    tgt_buf[0] = TOK_BOS;
-    int tgt_len = 1;
-
-    int fixed_len = seq_len;
-
-    int *src_pad = (int *)malloc((size_t)fixed_len * sizeof(int));
-
-    for (int s = 0; s < fixed_len; s++) {
-        src_pad[s] = (s < src_len_raw) ? src_raw[s] : TOK_PAD;
-    }
+    transformer_lm_init_cache(model, src_ids, src_len, kv);
 
     printf("EN: %s\nZH: ", en_text);
 
-    for (int step = 0; step < max_len && tgt_len < fixed_len; step++) {
-        int *tgt_pad = (int *)malloc((size_t)fixed_len * sizeof(int));
-        for (int s = 0; s < fixed_len; s++) {
-            tgt_pad[s] = (s < tgt_len) ? tgt_buf[s] : TOK_PAD;
-        }
-
-        Tensor3D causal = mask_causal_create(fixed_len);
-
-        TransformerCache cache = {0};
-        Tensor3D output = transformer_forward_lm(model,
-                                                 src_pad, fixed_len,
-                                                 tgt_pad, fixed_len,
-                                                 1,
-                                                 NULL, &causal, &cache);
-
-        int logit_offset = (tgt_len - 1) * vocab_size;
-        int pred = sample_logits(&output.data[logit_offset], vocab_size, temperature);
-
-        transformer_cache_free(&cache, model->config.encoder_layers, model->config.decoder_layers);
-        tensor_free(&output);
-        tensor_free(&causal);
-        free(tgt_pad);
+    int tgt_len = 0;
+    int next = TOK_BOS;
+    for (int step = 0; step < max_len; step++) {
+        Tensor3D logits = transformer_lm_step(model, next, kv);
+        int pred = sample_logits(logits.data, vocab_size, temperature, probs_buf);
+        tensor_free(&logits);
 
         if (pred == TOK_EOS) break;
-
         tgt_buf[tgt_len++] = pred;
+        next = pred;
     }
 
-    {
-        char text_buf[4096];
-        tokenizer_decode(tok, tgt_buf + 1, tgt_len - 1, text_buf, sizeof(text_buf));
-        printf("%s\n\n", text_buf);
-    }
+    char text_buf[4096];
+    tokenizer_decode(tok, tgt_buf, tgt_len, text_buf, sizeof(text_buf));
+    printf("%s\n\n", text_buf);
 
-    printf("\n\n");
-
-    free(src_raw);
-    free(src_pad);
+    free(src_ids);
     free(tgt_buf);
+    free(probs_buf);
+    transformer_kv_cache_free(kv);
+}
+
+static const char *kDemoPrompts[] = {
+    "hello",
+    "good morning",
+    "thank you",
+    "i love you",
+    "what is your name",
+    NULL
+};
+
+static void run_demo_pass(Transformer *model, const TranslateHyperparams *hp,
+                          const Tokenizer *tok, const char *title, float temperature) {
+    printf("=== %s ===\n\n", title);
+    for (int i = 0; kDemoPrompts[i]; i++) {
+        translate_generate(model, hp, tok, kDemoPrompts[i], 16, temperature);
+    }
 }
 
 int main(void) {
@@ -327,8 +373,21 @@ int main(void) {
 
     printf("=== English to Chinese Translation Demo ===\n\n");
 
-    printf("Using byte-level tokenizer (shared for EN and ZH)...\n");
-    Tokenizer *tok = tokenizer_create_byte();
+    /* UTF-8 char-level tokenizer: each Chinese character / each ASCII char
+     * occupies exactly one token, so the model generates one full character
+     * per autoregressive step and can never emit a half multi-byte sequence. */
+    char *corpus_str = build_pairs_corpus_string();
+    if (!corpus_str) {
+        fprintf(stderr, "Failed to build corpus string\n");
+        return 1;
+    }
+    printf("Using UTF-8 char-level tokenizer (built from training corpus)...\n");
+    Tokenizer *tok = tokenizer_create_utf8(corpus_str, 1024, 1);
+    free(corpus_str);
+    if (!tok) {
+        fprintf(stderr, "Failed to create tokenizer\n");
+        return 1;
+    }
     printf("Vocab size: %d\n\n", tok->vocab_size);
 
     TranslationCorpus corpus = {0};
@@ -351,19 +410,8 @@ int main(void) {
         return 1;
     }
 
-    printf("\n=== Translation Test (greedy) ===\n\n");
-    translate_generate(model, &hp, tok, "hello", 16, 0.01f);
-    translate_generate(model, &hp, tok, "good morning", 16, 0.01f);
-    translate_generate(model, &hp, tok, "thank you", 16, 0.01f);
-    translate_generate(model, &hp, tok, "i love you", 16, 0.01f);
-    translate_generate(model, &hp, tok, "what is your name", 16, 0.01f);
-
-    printf("=== Translation Test (sampling T=0.5) ===\n\n");
-    translate_generate(model, &hp, tok, "hello", 16, 0.5f);
-    translate_generate(model, &hp, tok, "good morning", 16, 0.5f);
-    translate_generate(model, &hp, tok, "thank you", 16, 0.5f);
-    translate_generate(model, &hp, tok, "i love you", 16, 0.5f);
-    translate_generate(model, &hp, tok, "what is your name", 16, 0.5f);
+    run_demo_pass(model, &hp, tok, "Translation Test (greedy)", 0.01f);
+    run_demo_pass(model, &hp, tok, "Translation Test (sampling T=0.5)", 0.5f);
 
     free_translation_corpus(&corpus);
     if (ts) training_state_free(ts);

@@ -73,6 +73,16 @@ static void install_specials(Tokenizer *t) {
     }
 }
 
+/* Returns the UTF-8 byte length (1~4) of a character whose first byte is `c`.
+ * Invalid leading bytes are treated as a 1-byte sequence. */
+static int utf8_char_len(unsigned char c) {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
 Tokenizer *tokenizer_create_byte(void) {
     Tokenizer *t = (Tokenizer *)calloc(1, sizeof(Tokenizer));
     t->kind = TOKENIZER_BYTE;
@@ -279,6 +289,102 @@ Tokenizer *tokenizer_create_word(const char *corpus, int max_vocab, int lowercas
     return t;
 }
 
+Tokenizer *tokenizer_create_utf8(const char *corpus, int max_vocab, int lowercase) {
+    if (!corpus) return NULL;
+    if (max_vocab < TOK_NUM_SPECIALS + 1) max_vocab = TOK_NUM_SPECIALS + 1;
+
+    /* Accumulate per-character frequencies in a temporary hash table keyed
+     * by the UTF-8 byte string. */
+    int n_buckets = 1024;
+    TokenizerEntry **tmp_buckets =
+        (TokenizerEntry **)calloc((size_t)n_buckets, sizeof(TokenizerEntry *));
+
+    int wc_cap = 64;
+    int wc_n = 0;
+    WordCount *wcs = (WordCount *)malloc((size_t)wc_cap * sizeof(WordCount));
+
+    char ch[8];
+    for (size_t i = 0; corpus[i];) {
+        unsigned char c = (unsigned char)corpus[i];
+        int L = utf8_char_len(c);
+        /* Guard against running past the terminator. */
+        for (int k = 0; k < L; k++) {
+            if (!corpus[i + k]) { L = k > 0 ? k : 1; break; }
+        }
+        memcpy(ch, corpus + i, (size_t)L);
+        ch[L] = 0;
+        i += (size_t)L;
+
+        if (lowercase && L == 1 && ch[0] >= 'A' && ch[0] <= 'Z') {
+            ch[0] = (char)(ch[0] + 32);
+        }
+
+        unsigned long h = hash_str(ch) % (unsigned long)n_buckets;
+        TokenizerEntry *e = tmp_buckets[h];
+        int idx = -1;
+        while (e) {
+            if (strcmp(e->token, ch) == 0) { idx = e->id; break; }
+            e = e->next;
+        }
+        if (idx < 0) {
+            if (wc_n >= wc_cap) {
+                wc_cap *= 2;
+                wcs = (WordCount *)realloc(wcs, (size_t)wc_cap * sizeof(WordCount));
+            }
+            wcs[wc_n].word = xstrdup(ch);
+            wcs[wc_n].count = 1;
+            TokenizerEntry *ne = (TokenizerEntry *)malloc(sizeof(TokenizerEntry));
+            ne->token = xstrdup(ch);
+            ne->id = wc_n;
+            ne->next = tmp_buckets[h];
+            tmp_buckets[h] = ne;
+            wc_n++;
+        } else {
+            wcs[idx].count++;
+        }
+    }
+
+    for (int i = 0; i < n_buckets; i++) {
+        TokenizerEntry *e = tmp_buckets[i];
+        while (e) {
+            TokenizerEntry *next = e->next;
+            free(e->token);
+            free(e);
+            e = next;
+        }
+    }
+    free(tmp_buckets);
+
+    qsort(wcs, (size_t)wc_n, sizeof(WordCount), wc_cmp_desc);
+
+    int keep = wc_n + TOK_NUM_SPECIALS;
+    if (keep > max_vocab) keep = max_vocab;
+
+    Tokenizer *t = (Tokenizer *)calloc(1, sizeof(Tokenizer));
+    t->kind = TOKENIZER_UTF8;
+    t->vocab_size = keep;
+    t->lowercase = lowercase ? 1 : 0;
+    t->id_to_token = (char **)calloc((size_t)keep, sizeof(char *));
+    hash_init(t, keep * 2 + 7);
+    install_specials(t);
+
+    int max_len = 1;
+    for (int i = 0; i < keep - TOK_NUM_SPECIALS && i < wc_n; i++) {
+        int id = TOK_NUM_SPECIALS + i;
+        t->id_to_token[id] = xstrdup(wcs[i].word);
+        hash_insert(t, wcs[i].word, id);
+        int L = (int)strlen(wcs[i].word);
+        if (L > max_len) max_len = L;
+    }
+    t->max_token_len = max_len;
+
+    for (int i = 0; i < 256; i++) t->char_to_id[i] = -1;
+
+    for (int i = 0; i < wc_n; i++) free(wcs[i].word);
+    free(wcs);
+    return t;
+}
+
 void tokenizer_free(Tokenizer *t) {
     if (!t) return;
     if (t->id_to_token) {
@@ -318,6 +424,25 @@ int tokenizer_encode(const Tokenizer *t, const char *text, int *out, int max_out
             }
             if (id < 0) id = TOK_UNK;
             out[n++] = id;
+        }
+        return n;
+    }
+    if (t->kind == TOKENIZER_UTF8) {
+        char ch[8];
+        for (size_t i = 0; text[i] && n < max_out; ) {
+            unsigned char c = (unsigned char)text[i];
+            int L = utf8_char_len(c);
+            for (int k = 0; k < L; k++) {
+                if (!text[i + k]) { L = k > 0 ? k : 1; break; }
+            }
+            memcpy(ch, text + i, (size_t)L);
+            ch[L] = 0;
+            i += (size_t)L;
+            if (t->lowercase && L == 1 && ch[0] >= 'A' && ch[0] <= 'Z') {
+                ch[0] = (char)(ch[0] + 32);
+            }
+            int id = hash_lookup(t, ch);
+            out[n++] = id >= 0 ? id : TOK_UNK;
         }
         return n;
     }
@@ -386,6 +511,7 @@ void tokenizer_print_stats(const Tokenizer *t, FILE *out) {
         case TOKENIZER_CHAR: kind = "char"; break;
         case TOKENIZER_BYTE: kind = "byte"; break;
         case TOKENIZER_WORD: kind = "word"; break;
+        case TOKENIZER_UTF8: kind = "utf8"; break;
     }
     fprintf(out, "Tokenizer{kind=%s, vocab=%d, max_token_len=%d, lowercase=%d}\n",
             kind, t->vocab_size, t->max_token_len, t->lowercase);
