@@ -339,7 +339,13 @@ void text_lm_generate_with_tokenizer_cached(Transformer *model,
         fprintf(out, "\n\n");
         return;
     }
-    transformer_lm_init_cache(model, buf + seed_start, seed_len, cache);
+    /* Match the no-cache path (run_one_step) which feeds a causal mask to
+     * BOTH encoder and decoder. Without it the encoder would attend
+     * bidirectionally and produce different cross-attn K/V than the full
+     * forward path, making the two outputs diverge. */
+    Tensor3D src_mask = mask_causal_create(seed_len);
+    transformer_lm_init_cache(model, buf + seed_start, seed_len, &src_mask, cache);
+    tensor_free(&src_mask);
 
     /* Prime the decoder with the seed so its self-attn cache contains the
      * full prefix; we discard the logits of all but the last position. */
@@ -374,6 +380,105 @@ void text_lm_generate_with_tokenizer_cached(Transformer *model,
     if (primed_logits.data) tensor_free(&primed_logits);
 
     transformer_kv_cache_free(cache);
+    fprintf(out, "\n\n");
+    free(buf);
+}
+
+void text_lm_generate_with_tokenizer_fixed_src(Transformer *model,
+                                               const TextLmHyperparams *hp,
+                                               const Tokenizer *tok,
+                                               const char *seed, int length,
+                                               float temperature, FILE *out) {
+    if (!model || !tok || model->config.vocab_size <= 0) {
+        text_lm_generate_with_tokenizer(model, hp, tok, seed, length,
+                                        temperature, out);
+        return;
+    }
+
+    int d_model = model->config.d_model;
+    int seq_cap = hp->seq_len;
+    int buf_cap = length + 64;
+    int *buf = (int *)malloc((size_t)buf_cap * sizeof(int));
+    if (!buf) return;
+    int buf_len = 0;
+
+    if (seed && seed[0]) {
+        buf_len = tokenizer_encode(tok, seed, buf, buf_cap);
+    }
+    if (buf_len == 0) {
+        buf[buf_len++] = TOK_BOS;
+    }
+
+    char text_buf[2048];
+    tokenizer_decode(tok, buf, buf_len, text_buf, sizeof(text_buf));
+    fprintf(out, "Seed: \"%s\"\nGenerated: %s", seed ? seed : "", text_buf);
+    fflush(out);
+
+    int last_emit_len = (int)strlen(text_buf);
+
+    /* Mirror the cached variant: encoder sees the seed once with a causal
+     * mask, decoder grows. We bypass transformer_forward_lm to keep the
+     * cross-attn mask = NULL (matching attn_step_compute in the cache
+     * path); otherwise the causal seed mask would be misinterpreted as a
+     * padding mask once tgt_len > seed_len. */
+    int seed_start = (buf_len > seq_cap) ? (buf_len - seq_cap) : 0;
+    int seed_len = buf_len - seed_start;
+    const int *src_ids = buf + seed_start;
+    int vocab_size = model->config.vocab_size;
+    int dec_max = model->config.max_len;
+
+    Tensor3D src_emb = tensor_create(1, seed_len, d_model);
+    for (int s = 0; s < seed_len; s++) {
+        int tok_id = src_ids[s];
+        if (tok_id < 0 || tok_id >= model->token_embedding->rows) tok_id = 0;
+        memcpy(src_emb.data + (size_t)s * d_model,
+               model->token_embedding->data + (size_t)tok_id * d_model,
+               sizeof(float) * (size_t)d_model);
+    }
+    Tensor3D enc_mask = mask_causal_create(seed_len);
+    Tensor3D encoder_out = encoder_forward(model->encoder, &src_emb, &enc_mask, NULL);
+    tensor_free(&src_emb);
+    tensor_free(&enc_mask);
+
+    for (int step = 0; step < length; step++) {
+        int tgt_start = (buf_len > dec_max) ? (buf_len - dec_max) : 0;
+        int tgt_len = buf_len - tgt_start;
+
+        Tensor3D tgt_emb = tensor_create(1, tgt_len, d_model);
+        for (int s = 0; s < tgt_len; s++) {
+            int tok_id = buf[tgt_start + s];
+            if (tok_id < 0 || tok_id >= model->token_embedding->rows) tok_id = 0;
+            memcpy(tgt_emb.data + (size_t)s * d_model,
+                   model->token_embedding->data + (size_t)tok_id * d_model,
+                   sizeof(float) * (size_t)d_model);
+        }
+        Tensor3D tgt_mask = mask_causal_create(tgt_len);
+        Tensor3D dec_out = decoder_forward(model->decoder, &tgt_emb, &encoder_out,
+                                           NULL, &tgt_mask, NULL);
+        tensor_free(&tgt_emb);
+        tensor_free(&tgt_mask);
+
+        Tensor3D logits = tensor_create(1, tgt_len, vocab_size);
+        tensor_linear_forward(&dec_out, model->logit_head, &logits);
+        tensor_free(&dec_out);
+
+        int last_offset = (tgt_len - 1) * vocab_size;
+        int pred = sample_logits(&logits.data[last_offset], vocab_size, temperature);
+        tensor_free(&logits);
+
+        if (pred == TOK_EOS) break;
+        if (buf_len >= buf_cap) break;
+        buf[buf_len++] = pred;
+
+        tokenizer_decode(tok, buf, buf_len, text_buf, sizeof(text_buf));
+        int new_len = (int)strlen(text_buf);
+        if (new_len > last_emit_len) {
+            fputs(text_buf + last_emit_len, out);
+            fflush(out);
+            last_emit_len = new_len;
+        }
+    }
+    tensor_free(&encoder_out);
     fprintf(out, "\n\n");
     free(buf);
 }

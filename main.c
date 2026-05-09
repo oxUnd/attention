@@ -1,6 +1,7 @@
 #include "text_lm.h"
 #include "tokenizer.h"
 #include "transformer.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -281,6 +282,10 @@ int main(int argc, char **argv) {
 
     TextLmHyperparams hp;
     hyperparams_from_model(model, &hp);
+    /* Always trust the actual model's vocab size; only override from the
+     * tokenizer if it agrees. Falling back to the default (28) silently
+     * produces gibberish when the .tok file is missing. */
+    if (model->config.vocab_size > 0) hp.vocab_size = model->config.vocab_size;
     if (tok) hp.vocab_size = tok->vocab_size;
 
     printf("Loaded: %s (d_model=%d, layers enc/dec=%d/%d, vocab=%d%s)\n",
@@ -300,7 +305,7 @@ int main(int argc, char **argv) {
         clock_t t0, t1;
         srand(42);
         t0 = clock();
-        text_lm_generate_with_tokenizer(model, &hp, tok, seed, n, 1e-4f, stdout);
+        text_lm_generate_with_tokenizer_fixed_src(model, &hp, tok, seed, n, 1e-4f, stdout);
         t1 = clock();
         double no_cache_s = (double)(t1 - t0) / CLOCKS_PER_SEC;
 

@@ -74,29 +74,32 @@ static void merge_heads(const Tensor3D *heads, Tensor3D *flat,
 /* Apply a mask tensor in-place to attention scores by setting blocked cells to
  * a large negative value before the row-wise softmax. The mask supports two
  * shapes:
- *   (1 or batch, seq_len, seq_len)  -> per (q_pos, k_pos) (e.g. causal)
- *   (1 or batch, *,       seq_len)  -> per (k_pos)         (padding)
+ *   (1 or batch, q_len, kv_len) -> per (q_pos, k_pos) (e.g. causal)
+ *   (1 or batch, *,     kv_len) -> per (k_pos)         (padding)
  */
 static void apply_attn_mask(Tensor3D *scores, const Tensor3D *mask,
-                            int batch_size, int num_heads, int seq_len) {
+                            int batch_size, int num_heads,
+                            int q_len, int kv_len) {
     if (!mask || !mask->data) return;
     int mb = mask->batch_size;
     int ms = mask->seq_len;
     int md = mask->d_model;
-    int has_query_dim = (ms == seq_len && md == seq_len);
-    int has_padding_only = (!has_query_dim && md == seq_len);
+    int has_query_dim = (ms == q_len && md == kv_len);
+    int has_padding_only = (!has_query_dim && md == kv_len);
     if (!has_query_dim && !has_padding_only) return;
 
     for (int b = 0; b < batch_size; b++) {
         int mask_b = (mb == 1) ? 0 : b;
         for (int h = 0; h < num_heads; h++) {
-            for (int q_pos = 0; q_pos < seq_len; q_pos++) {
-                for (int k_pos = 0; k_pos < seq_len; k_pos++) {
+            for (int q_pos = 0; q_pos < q_len; q_pos++) {
+                for (int k_pos = 0; k_pos < kv_len; k_pos++) {
                     float m = has_query_dim
-                        ? mask->data[mask_b * seq_len * seq_len + q_pos * seq_len + k_pos]
-                        : mask->data[mask_b * seq_len + k_pos];
+                        ? mask->data[mask_b * q_len * kv_len + q_pos * kv_len + k_pos]
+                        : mask->data[mask_b * kv_len + k_pos];
                     if (m == 0.0f) {
-                        scores->data[score_offset(b, h, q_pos, k_pos, num_heads, seq_len)] = -1e9f;
+                        scores->data[b * num_heads * q_len * kv_len
+                                   + h * q_len * kv_len
+                                   + q_pos * kv_len + k_pos] = -1e9f;
                     }
                 }
             }
@@ -105,27 +108,28 @@ static void apply_attn_mask(Tensor3D *scores, const Tensor3D *mask,
 }
 
 /* Row-wise softmax along k_pos: for each (b, h, q_pos), the block of
- * `seq_len` cells [q_pos*seq_len .. q_pos*seq_len + seq_len) is normalised. */
+ * `kv_len` cells [q_pos*kv_len .. q_pos*kv_len + kv_len) is normalised. */
 static void attention_softmax_inplace(Tensor3D *scores,
-                                      int batch_size, int num_heads, int seq_len) {
+                                      int batch_size, int num_heads,
+                                      int q_len, int kv_len) {
     for (int b = 0; b < batch_size; b++) {
         for (int h = 0; h < num_heads; h++) {
-            for (int q_pos = 0; q_pos < seq_len; q_pos++) {
+            for (int q_pos = 0; q_pos < q_len; q_pos++) {
                 float *row = scores->data
-                           + b * num_heads * seq_len * seq_len
-                           + h * seq_len * seq_len
-                           + q_pos * seq_len;
+                           + b * num_heads * q_len * kv_len
+                           + h * q_len * kv_len
+                           + q_pos * kv_len;
                 float max_val = row[0];
-                for (int k_pos = 1; k_pos < seq_len; k_pos++) {
+                for (int k_pos = 1; k_pos < kv_len; k_pos++) {
                     if (row[k_pos] > max_val) max_val = row[k_pos];
                 }
                 float sum = 0.0f;
-                for (int k_pos = 0; k_pos < seq_len; k_pos++) {
+                for (int k_pos = 0; k_pos < kv_len; k_pos++) {
                     row[k_pos] = expf(row[k_pos] - max_val);
                     sum += row[k_pos];
                 }
                 float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-                for (int k_pos = 0; k_pos < seq_len; k_pos++) {
+                for (int k_pos = 0; k_pos < kv_len; k_pos++) {
                     row[k_pos] *= inv;
                 }
             }
@@ -168,7 +172,8 @@ Tensor3D multi_head_attn_forward(MultiHeadAttention *attn,
                                  Tensor3D *query, Tensor3D *key, Tensor3D *value,
                                  Tensor3D *attn_mask, AttnCache *cache) {
     int batch_size = query->batch_size;
-    int seq_len = query->seq_len;
+    int q_len = query->seq_len;
+    int kv_len = key->seq_len;
     int d_model = query->d_model;
     int num_heads = attn->num_heads;
     int head_dim = attn->head_dim;
@@ -179,67 +184,75 @@ Tensor3D multi_head_attn_forward(MultiHeadAttention *attn,
         cache->value_input = tensor_clone(value);
     }
 
-    /* Project Q/K/V. */
-    Tensor3D q_proj = tensor_create(batch_size, seq_len, d_model);
-    Tensor3D k_proj = tensor_create(batch_size, seq_len, d_model);
-    Tensor3D v_proj = tensor_create(batch_size, seq_len, d_model);
+    /* Project Q/K/V. K and V are sized by the *key* sequence length, which
+     * may differ from the query length in cross-attention. Sizing them with
+     * q_len would leave the trailing rows uninitialised (calloc gives zero)
+     * and softmax would then attend to phantom positions, polluting the
+     * output - that was the long-standing cross-attn bug. */
+    Tensor3D q_proj = tensor_create(batch_size, q_len,  d_model);
+    Tensor3D k_proj = tensor_create(batch_size, kv_len, d_model);
+    Tensor3D v_proj = tensor_create(batch_size, kv_len, d_model);
     tensor_linear_forward(query, attn->Wq, &q_proj);
     tensor_linear_forward(key,   attn->Wk, &k_proj);
     tensor_linear_forward(value, attn->Wv, &v_proj);
 
-    /* Reshape into multi-head form. */
-    Tensor3D q_heads = tensor_create(batch_size, num_heads, seq_len * head_dim);
-    Tensor3D k_heads = tensor_create(batch_size, num_heads, seq_len * head_dim);
-    Tensor3D v_heads = tensor_create(batch_size, num_heads, seq_len * head_dim);
+    /* Reshape into multi-head form (each head keeps its own seq dimension). */
+    Tensor3D q_heads = tensor_create(batch_size, num_heads, q_len  * head_dim);
+    Tensor3D k_heads = tensor_create(batch_size, num_heads, kv_len * head_dim);
+    Tensor3D v_heads = tensor_create(batch_size, num_heads, kv_len * head_dim);
     split_heads(&q_proj, &q_heads, num_heads, head_dim);
     split_heads(&k_proj, &k_heads, num_heads, head_dim);
     split_heads(&v_proj, &v_heads, num_heads, head_dim);
 
-    /* Compute scaled dot-product scores. */
-    Tensor3D scores = tensor_create(batch_size, num_heads, seq_len * seq_len);
+    /* Compute scaled dot-product scores: shape (B, H, q_len, kv_len). */
+    Tensor3D scores = tensor_create(batch_size, num_heads, q_len * kv_len);
     float scale = sqrtf((float)head_dim);
     for (int b = 0; b < batch_size; b++) {
         for (int h = 0; h < num_heads; h++) {
-            for (int q_pos = 0; q_pos < seq_len; q_pos++) {
-                for (int k_pos = 0; k_pos < seq_len; k_pos++) {
+            for (int q_pos = 0; q_pos < q_len; q_pos++) {
+                for (int k_pos = 0; k_pos < kv_len; k_pos++) {
                     float dot = 0.0f;
                     for (int d = 0; d < head_dim; d++) {
-                        dot += q_heads.data[head_offset(b, h, q_pos, d, num_heads, seq_len, head_dim)]
-                             * k_heads.data[head_offset(b, h, k_pos, d, num_heads, seq_len, head_dim)];
+                        dot += q_heads.data[head_offset(b, h, q_pos, d, num_heads, q_len,  head_dim)]
+                             * k_heads.data[head_offset(b, h, k_pos, d, num_heads, kv_len, head_dim)];
                     }
-                    scores.data[score_offset(b, h, q_pos, k_pos, num_heads, seq_len)] = dot / scale;
+                    scores.data[b * num_heads * q_len * kv_len
+                              + h * q_len * kv_len
+                              + q_pos * kv_len + k_pos] = dot / scale;
                 }
             }
         }
     }
 
-    apply_attn_mask(&scores, attn_mask, batch_size, num_heads, seq_len);
-    attention_softmax_inplace(&scores, batch_size, num_heads, seq_len);
+    apply_attn_mask(&scores, attn_mask, batch_size, num_heads, q_len, kv_len);
+    attention_softmax_inplace(&scores, batch_size, num_heads, q_len, kv_len);
 
     if (cache) cache->attn_weights = tensor_clone(&scores);
 
     /* Weighted sum over values. */
-    Tensor3D attended = tensor_create(batch_size, num_heads, seq_len * head_dim);
+    Tensor3D attended = tensor_create(batch_size, num_heads, q_len * head_dim);
     for (int b = 0; b < batch_size; b++) {
         for (int h = 0; h < num_heads; h++) {
-            for (int q_pos = 0; q_pos < seq_len; q_pos++) {
+            for (int q_pos = 0; q_pos < q_len; q_pos++) {
                 for (int d = 0; d < head_dim; d++) {
                     float sum = 0.0f;
-                    for (int k_pos = 0; k_pos < seq_len; k_pos++) {
-                        sum += scores.data[score_offset(b, h, q_pos, k_pos, num_heads, seq_len)]
-                             * v_heads.data[head_offset(b, h, k_pos, d, num_heads, seq_len, head_dim)];
+                    for (int k_pos = 0; k_pos < kv_len; k_pos++) {
+                        sum += scores.data[b * num_heads * q_len * kv_len
+                                         + h * q_len * kv_len
+                                         + q_pos * kv_len + k_pos]
+                             * v_heads.data[head_offset(b, h, k_pos, d, num_heads, kv_len, head_dim)];
                     }
-                    attended.data[head_offset(b, h, q_pos, d, num_heads, seq_len, head_dim)] = sum;
+                    attended.data[head_offset(b, h, q_pos, d, num_heads, q_len, head_dim)] = sum;
                 }
             }
         }
     }
 
     /* Merge heads + output projection. */
-    Tensor3D merged = tensor_create(batch_size, seq_len, d_model);
+    Tensor3D merged = tensor_create(batch_size, q_len, d_model);
     merge_heads(&attended, &merged, num_heads, head_dim);
 
-    Tensor3D out = tensor_create(batch_size, seq_len, d_model);
+    Tensor3D out = tensor_create(batch_size, q_len, d_model);
     tensor_linear_forward(&merged, attn->Wo, &out);
 
     tensor_free(&q_proj); tensor_free(&k_proj); tensor_free(&v_proj);
@@ -1508,6 +1521,7 @@ void transformer_kv_cache_free(TransformerKVCache *cache) {
 
 void transformer_lm_init_cache(Transformer *t,
                                const int *src_ids, int src_len,
+                               Tensor3D *src_mask,
                                TransformerKVCache *cache) {
     if (!t || !cache || t->config.vocab_size <= 0) return;
     int d_model = t->config.d_model;
@@ -1516,8 +1530,11 @@ void transformer_lm_init_cache(Transformer *t,
     Tensor3D src_emb = tensor_create(1, src_len, d_model);
     embed_lookup(t->token_embedding, src_ids, &src_emb);
 
-    /* 2. Run the encoder once (no training cache needed). */
-    Tensor3D encoder_out = encoder_forward(t->encoder, &src_emb, NULL, NULL);
+    /* 2. Run the encoder once (no training cache needed). The src_mask is
+     * forwarded as-is so callers can match the full-forward path exactly
+     * (e.g. text-LM uses a causal mask on the encoder, while seq2seq
+     * translation passes NULL). */
+    Tensor3D encoder_out = encoder_forward(t->encoder, &src_emb, src_mask, NULL);
     tensor_free(&src_emb);
 
     /* 3. Reset self-attn buffers and pre-project cross-attn K/V per layer. */

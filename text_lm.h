@@ -71,6 +71,17 @@ void text_lm_generate_with_tokenizer_cached(Transformer *model,
                                             const char *seed, int length,
                                             float temperature, FILE *out);
 
+/* No-cache baseline that uses the SAME protocol as the cached variant
+ * (encoder context is frozen at the seed, only the decoder context grows).
+ * Use this for apples-to-apples cache speedup benchmarking and correctness
+ * checks: every generated token must match between the two paths bit-for-bit
+ * given the same RNG state. */
+void text_lm_generate_with_tokenizer_fixed_src(Transformer *model,
+                                               const TextLmHyperparams *hp,
+                                               const Tokenizer *tok,
+                                               const char *seed, int length,
+                                               float temperature, FILE *out);
+
 int text_lm_save(Transformer *model, TrainingState *ts, float lr, const char *path);
 int text_lm_load(const char *path, Transformer **model_out, TrainingState **ts_out);
 

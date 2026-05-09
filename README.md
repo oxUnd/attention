@@ -224,7 +224,7 @@ Generated: the cat is happy. the bird is sad. the cat sees the dog. ...
 
 ```c
 TransformerKVCache *cache = transformer_kv_cache_create(model, max_decode_len);
-transformer_lm_init_cache(model, src_ids, src_len, cache);  /* 跑一次 encoder + 预投影 cross K/V */
+transformer_lm_init_cache(model, src_ids, src_len, src_mask, cache);  /* 跑一次 encoder + 预投影 cross K/V；src_mask 需匹配全量路径，translation 传 NULL，text-LM 传 causal mask */
 for (int step = 0; step < N; step++) {
     Tensor3D logits = transformer_lm_step(model, next_token_id, cache);
     int next = sample(logits);

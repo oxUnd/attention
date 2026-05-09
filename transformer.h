@@ -313,9 +313,14 @@ typedef struct {
 
 TransformerKVCache *transformer_kv_cache_create(const Transformer *t, int max_len);
 void transformer_kv_cache_free(TransformerKVCache *cache);
-/* Resets cur_len=0; cross-attn K/V are recomputed for the new src. */
+/* Resets cur_len=0; cross-attn K/V are recomputed for the new src.
+ * `src_mask` is forwarded to the encoder verbatim (NULL = no masking). It
+ * MUST match the mask used at training/inference of the equivalent full
+ * forward path, otherwise the encoder outputs - and therefore the cross-
+ * attention K/V - will diverge from the no-cache path. */
 void transformer_lm_init_cache(Transformer *t,
                                const int *src_ids, int src_len,
+                               Tensor3D *src_mask,
                                TransformerKVCache *cache);
 /* Returns logits of shape (1, 1, vocab_size). Caller owns the buffer and
  * must tensor_free it. */

@@ -325,7 +325,7 @@ static void translate_generate(Transformer *model, const TranslateHyperparams *h
         return;
     }
 
-    transformer_lm_init_cache(model, src_ids, src_len, kv);
+    transformer_lm_init_cache(model, src_ids, src_len, NULL, kv);
 
     printf("EN: %s\nZH: ", en_text);
 
