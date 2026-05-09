@@ -356,14 +356,14 @@ int main(void) {
     translate_generate(model, &hp, tok, "good morning", 16, 0.01f);
     translate_generate(model, &hp, tok, "thank you", 16, 0.01f);
     translate_generate(model, &hp, tok, "i love you", 16, 0.01f);
-    translate_generate(model, &hp, tok, "what is you name", 16, 0.01f);
+    translate_generate(model, &hp, tok, "what is your name", 16, 0.01f);
 
     printf("=== Translation Test (sampling T=0.5) ===\n\n");
     translate_generate(model, &hp, tok, "hello", 16, 0.5f);
     translate_generate(model, &hp, tok, "good morning", 16, 0.5f);
     translate_generate(model, &hp, tok, "thank you", 16, 0.5f);
     translate_generate(model, &hp, tok, "i love you", 16, 0.5f);
-    translate_generate(model, &hp, tok, "what is you name", 16, 0.5f);
+    translate_generate(model, &hp, tok, "what is your name", 16, 0.5f);
 
     free_translation_corpus(&corpus);
     if (ts) training_state_free(ts);

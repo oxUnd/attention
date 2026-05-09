@@ -1180,8 +1180,8 @@ Tensor3D transformer_forward(Transformer *t, Tensor3D *src, Tensor3D *tgt,
         encoder_out = encoder_forward(t->encoder, &src_proj, src_mask, &cache->encoder_cache);
     } else {
         encoder_out = encoder_forward(t->encoder, &src_proj, src_mask, NULL);
-        tensor_free(&src_proj);
     }
+    tensor_free(&src_proj);
 
     Tensor3D tgt_proj = tensor_create(tgt->batch_size, tgt->seq_len, tgt->d_model);
     tensor_linear_forward(tgt, t->input_projection, &tgt_proj);
@@ -1197,13 +1197,13 @@ Tensor3D transformer_forward(Transformer *t, Tensor3D *src, Tensor3D *tgt,
         cache->decoder_out = tensor_clone(&decoder_out);
     } else {
         decoder_out = decoder_forward(t->decoder, &tgt_proj, &encoder_out, src_mask, tgt_mask, NULL);
-        tensor_free(&tgt_proj);
-        tensor_free(&encoder_out);
     }
+    tensor_free(&tgt_proj);
+    tensor_free(&encoder_out);
 
     Tensor3D out = tensor_create(decoder_out.batch_size, decoder_out.seq_len, t->config.d_model);
     tensor_linear_forward(&decoder_out, t->output_projection, &out);
-    if (!cache) tensor_free(&decoder_out);
+    tensor_free(&decoder_out);
     return out;
 }
 
@@ -1333,15 +1333,14 @@ Tensor3D transformer_forward_lm(Transformer *t,
     } else {
         decoder_out = decoder_forward(t->decoder, &tgt_emb, &encoder_out,
                                       src_mask, tgt_mask, NULL);
-        tensor_free(&encoder_out);
     }
+    tensor_free(&encoder_out);
     tensor_free(&tgt_emb);
 
     /* Logit head: logits = decoder_out @ logit_head^T -> (B, S_tgt, vocab). */
     Tensor3D logits = tensor_create(batch_size, tgt_len, vocab_size);
     tensor_linear_forward(&decoder_out, t->logit_head, &logits);
-
-    if (!cache) tensor_free(&decoder_out);
+    tensor_free(&decoder_out);
     return logits;
 }
 
