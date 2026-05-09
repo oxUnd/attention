@@ -9,8 +9,10 @@
 - [可执行文件](#可执行文件)
 - [Tokenizer 能力](#tokenizer-能力)
 - [字符 / 词级语言模型 CLI](#字符--词级语言模型-cli)
+- [前向过程可视化](#前向过程可视化)
 - [对原框架的评估](#对原框架的评估)
 - [本次主要改动](#本次主要改动)
+- [Bug 修复记录](#bug-修复记录)
 
 ---
 
@@ -20,6 +22,7 @@
 make            # 构建全部可执行文件
 make text       # 运行内置文本训练 demo（词级 + 字符级）
 make train      # 运行 copy-task 演示
+make translate  # 运行英→中翻译 demo
 make test       # 打印 transformer 的命令行帮助
 make clean      # 清理产物
 ```
@@ -34,11 +37,14 @@ nn_math.{h,c}      Tensor3D / Matrix 数据结构、激活、Linear、Softmax、
                    底层数学原语（与具体模型解耦，方便复用）
 transformer.{h,c}  MultiHeadAttention / FeedForward / PositionalEncoding /
                    Encoder / Decoder / Transformer 的前向反向、TrainingState /
-                   Trainer 高层封装、checkpoint I/O
-tokenizer.{h,c}    char / byte / word 三种分词器 + 特殊符号 + 词表持久化
-text_lm.{h,c}      文本语言模型训练循环、采样生成（含 tokenizer 接入）
-main.c             带参 CLI（训练 / 加载 / 续写）
-train_*.c          各种独立训练演示
+                   Trainer 高层封装、checkpoint I/O、KV cache 增量解码
+tokenizer.{h,c}    char / byte / word / utf8 四种分词器 + 特殊符号 + 词表持久化
+text_lm.{h,c}      文本语言模型训练循环、采样生成（含 tokenizer 接入、KV cache 路径）
+main.c             带参 CLI（训练 / 加载 / 续写 / bench）
+visualize.c        加载模型跑一次前向，生成自包含可视化 HTML
+train_text.c       内置语料文本训练 demo（词级 + 字符级）
+train_translate.c  英→中翻译演示，使用 KV cache 加速推理
+train_*.c          其它独立训练演示（copy_task / simple / full）
 ```
 
 `transformer.{h,c}` 里的字段命名遵循当前主流框架习惯：`num_heads`、`head_dim`、
@@ -50,11 +56,13 @@ train_*.c          各种独立训练演示
 
 | 目标 | 说明 |
 |------|------|
-| `transformer` | 主程序：可选 char/word/byte 任一 tokenizer，训练并保存模型 + 词表，加载续写 |
+| `transformer` | 主程序：可选 char/word/byte/utf8 任一 tokenizer，训练并保存模型 + 词表，加载续写，自带 `--bench-kv-cache` |
 | `train_text` | 内置语料的文本训练 demo：同时演示词级和字符级两种 tokenizer |
+| `train_translate` | 英→中翻译演示，使用 KV cache 加速推理 |
 | `train_full` | 较大规模的随机「复制」任务 |
 | `train_copy_task` | 另一套复制任务设置 |
 | `train_simple` | 单序列复制 sanity check |
+| `visualize` | 加载模型 + 跑一次前向 + 把全部内部张量导出为**单文件离线 HTML**（带自动播放时间轴） |
 
 ## Tokenizer 能力
 
@@ -72,6 +80,7 @@ train_*.c          各种独立训练演示
 | `char` | 仅保留指定 charset，自动小写折叠 | 4 + |charset| |
 | `byte` | 256 字节级，UTF-8 / 二进制安全 | 4 + 256 = 260 |
 | `word` | 从语料按词频构建（去重 + punctuation 拆分），可设上限 | ≤ `--vocab-size` |
+| `utf8` | UTF-8 码点级（每个 Unicode codepoint 是一个 token），中文/emoji 不会被字节级截断 | 4 + 唯一码点数（≤ `--vocab-size`） |
 
 API 摘要（详见 `tokenizer.h`）：
 
@@ -136,7 +145,7 @@ max_token_len 6
 | `--load <path>` | 加载模式：读取已保存模型 + 词表。 |
 | `--out <path>` | 训练完成后保存到此路径（自动同时写 `<path>.tok`）。 |
 | `--generate <seed>` | 生成模式：从 seed 文本采样续写。 |
-| `--tokenizer <kind>` | `char` / `word` / `byte`，默认 `char`。 |
+| `--tokenizer <kind>` | `char` / `word` / `byte` / `utf8`，默认 `char`。 |
 | `--vocab-size <n>` | `word` 模式下的词表上限（默认 60）。 |
 | `--d-model <n>` | 模型宽度（默认 64，须 ≥ 词表大小）。 |
 | `--layers <enc>,<dec>` | 编码/解码层数。 |
@@ -147,6 +156,71 @@ max_token_len 6
 | `--bench-kv-cache` | 对加载的模型跑一次 with/without cache 时间对比并退出。 |
 
 `./train_text` 一口气演示词级 + 字符级两种 tokenizer 的训练 + 评估 + 采样，使用一段精心设计的小语料（约 800 字符 / 220 词 token），整体耗时 ~70s。
+
+## 前向过程可视化
+
+`visualize` 把一次完整的 LM 前向传播全部内部张量导出成**单文件离线 HTML**，所有 CSS / JS / JSON 数据全部内嵌，双击即可在任意现代浏览器中打开（不需要 server，也不需要任何外部资源）。
+
+```bash
+make visualize
+./visualize --load news_phase2.bin --seed "ai models capital and open" \
+            --out viz.html --max-tokens 12
+# 用浏览器打开 viz.html
+```
+
+可视化页面包含的所有"步骤"（按文档顺序）：
+
+1. **输入分词** — 每个 token 的 id 和 token 字符串
+2. **Token Embedding** — `(seq_len × d_model)` 嵌入查表结果（热图）
+3. **Positional Encoding** — sinusoidal PE 表（典型 sin/cos 条纹图案）
+4. **Embedding + PE** — 编码器输入
+5. 对每个 **Encoder Layer**（Pre-LN）：
+   - LN1 输出 → Self-attention 权重（每 head 一张矩阵，行 = query，列 = key）
+   - 残差 → LN2 → FFN 隐藏激活 → Layer 输出
+6. **Decoder 输入**（embedding + PE）
+7. 对每个 **Decoder Layer**（Pre-LN）：
+   - LN1 → 因果 Self-attention（下三角清晰可见）
+   - 残差1 → LN2 → Cross-attention（行 = decoder 位置，列 = encoder 位置）
+   - 残差2 → LN3 → FFN 隐藏激活 → Layer 输出
+8. **最终 logits** `(seq_len × vocab)`（蓝-白-红发散色图，正负 logit 一目了然）
+9. **Top-K predictions**（最后位置的 softmax 横向条形图）
+
+### 时间轴自动播放
+
+页面顶部的 sticky 工具栏支持把整个前向过程当作一段动画播放：
+
+| 控件 | 行为 |
+|------|------|
+| ▶ Play / ❚❚ Pause | 自动按顺序展开每一步、平滑滚动到该步、加发光动画边框 |
+| ◀ Prev / Next ▶ | 单步前进/后退 |
+| ↻ Reset | 回到第 1 步 |
+| 进度条 | 显示当前进度，**可点击跳转**到任意位置 |
+| Speed 滑块 | 300ms ~ 3000ms 每步停留时间 |
+| Space | 等价于 Play / Pause |
+| ← / → | 等价于 Prev / Next |
+
+每步会自动展开当前 `<details>` 及其所有祖先（保证嵌套层级深的步骤也可见），并把 section header 平滑滚动到工具栏正下方。
+
+### 热图交互
+
+- 鼠标悬停任意像素 → 显示 `[row, col] = value`
+- 自动选择色图：无符号张量用 viridis，有符号张量（如 logits、LN 输出）用蓝-白-红发散色图
+- 每张热图下方显示 `min / max / mean` 统计
+
+### 命令行参数
+
+```
+./visualize --load <model.bin> [--seed "text"] [--out viz.html] [--max-tokens N]
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--load` | (必填) | LM 模式 checkpoint（`vocab_size > 0`） |
+| `--seed` | `"the cat"` | 输入文本，会被同目录的 `<model>.tok` 编码 |
+| `--out` | `viz.html` | 输出文件路径 |
+| `--max-tokens` | 12 | 截断输入 token 数（控制热图分辨率与文件大小） |
+
+实现细节：复用 `TransformerCache`（本来就为反向传播缓存了所有中间张量），可视化只是"读"这些字段，**没有修改 transformer.c**。
 
 ## 对原框架的评估
 
@@ -263,6 +337,39 @@ no-cache 时间随 `length` 线性增长（因为每步还要重跑完整 encode
 ### 行为差异（重要）
 
 cache 路径的 encoder 上下文**冻结在 seed**——这是 KV cache 的本质前提（不冻结就得每步重跑 encoder，cache 失去意义）。这跟无 cache 路径的 "src 跟着新生成 token 一起滚动" 的行为略有差异，所以**多步生成下** with-cache 和 without-cache 的文字会发散，但每一步的 logits 在相同 src 下严格一致。
+
+如果需要做严格的 cache 正确性回归（每一步 logits 必须完全一致），用 `text_lm_generate_with_tokenizer_fixed_src` 作为 baseline——它沿用 cached 协议（encoder 跑一次、decoder 增长），输出与 cached 路径**逐 token 比特一致**（在 PE 表 `max_len` 范围内）。`./transformer --bench-kv-cache` 已经默认用这个 baseline。
+
+## Bug 修复记录
+
+经过 CLI 端到端验证，发现并修复了两个隐藏 bug：
+
+### BUG-1：cross-attention 中 K/V 张量维度错误（核心 bug）
+
+**症状**：`--bench-kv-cache` 输出与 no-cache 路径不一致，且复现性极强。
+
+**根因**：[`multi_head_attn_forward`](transformer.c) 在分配 K/V 投影张量时，错误地用了 `query->seq_len` 而不是 `key->seq_len`。当 `q_len ≠ kv_len`（cached LM 推理：src 固定、tgt 增长的 cross-attention），K/V 末尾几行实际上是 calloc 给的零，softmax 会"幻视"这些位置，并且 attn_mask 因维度不匹配被静默跳过——双重污染了注意力输出。
+
+**修复**：
+
+1. `multi_head_attn_forward` 拆分 `q_len` / `kv_len`，K/V proj/heads 按 `kv_len` 分配；`scores` 是 `q_len × kv_len`。
+2. `apply_attn_mask` 与 `attention_softmax_inplace` 也接受 `(q_len, kv_len)` 两个维度，正确识别 padding mask vs query-key mask。
+3. `transformer_lm_init_cache` 新增 `src_mask` 参数，让 cached 路径与 no-cache 路径用相同的 encoder mask（text-LM 传 causal mask、translation 传 NULL）。
+4. `text_lm.c` 新增 `text_lm_generate_with_tokenizer_fixed_src`：与 cached 路径协议一致（encoder 一次、decoder 增长）的全量 baseline，用于公平对比 + 比特级回归校验。
+5. `main.c` 的 `--bench-kv-cache` 改用 fixed_src 作为 baseline 与 cached 路径对比。
+
+**验证**：
+- `./train_translate` → loss 2.45→0.04，翻译输出正确（`hello`→`你好`、`thank you`→`谢谢` 等）
+- `./train_simple` / `./train_copy_task` → 收敛行为不变
+- `./transformer --bench-kv-cache` → 长度 22 token 中前 20 个比特一致，加速比 11×（短模型）至 490×（长上下文）
+
+### BUG-2：缺失 `.tok` 时词表大小回退到默认值（28）导致乱码
+
+**症状**：`./transformer --load <model>` 在没有同名 `.tok` 文件时静默生成乱码。
+
+**根因**：[`main.c`](main.c) 把 `hp.vocab_size` 直接默认到 `TEXT_LM_VOCAB_SIZE = 28`，与模型实际 vocab 不符，logit 头读越界。
+
+**修复**：优先信任模型自己保存的 `vocab_size`，再被 tokenizer（如果存在）覆盖。
 
 ## 其它
 
