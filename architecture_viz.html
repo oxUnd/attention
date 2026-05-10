@@ -1,0 +1,1303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transformer 纯 C 实现 — 架构原理交互式图解</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<style>
+:root {
+  --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+  --fg: #e6edf3; --fg2: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --orange: #d29922; --red: #f85149;
+  --purple: #bc8cff; --cyan: #39d353;
+  --card: #1c2128; --border: #30363d;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.7; }
+.max-w { max-width: 1140px; margin: 0 auto; padding: 0 24px; }
+
+/* Nav */
+nav { position: sticky; top: 0; z-index: 100; background: rgba(13,17,23,0.85); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); }
+nav .max-w { display: flex; align-items: center; gap: 16px; padding-top: 8px; padding-bottom: 8px; flex-wrap: wrap; }
+nav a { color: var(--fg2); text-decoration: none; font-size: 13px; padding: 4px 10px; border-radius: 6px; transition: all .2s; white-space: nowrap; }
+nav a:hover { color: var(--fg); background: var(--bg3); }
+nav .brand { color: var(--accent); font-weight: 700; font-size: 15px; margin-right: 8px; }
+
+/* Hero */
+.hero { padding: 80px 0 48px; text-align: center; }
+.hero h1 { font-size: 2.6rem; font-weight: 800; background: linear-gradient(135deg, var(--accent), var(--purple), var(--orange)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 16px; }
+.hero p { color: var(--fg2); font-size: 1.1rem; max-width: 680px; margin: 0 auto; }
+
+/* Section */
+section { padding: 64px 0; }
+section + section { border-top: 1px solid var(--border); }
+h2 { font-size: 1.8rem; margin-bottom: 24px; display: flex; align-items: center; gap: 12px; }
+h2 .num { background: var(--accent); color: var(--bg); width: 36px; height: 36px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; font-weight: 700; flex-shrink: 0; }
+h3 { font-size: 1.2rem; color: var(--accent); margin: 32px 0 12px; }
+h4 { font-size: 1rem; color: var(--orange); margin: 20px 0 8px; }
+
+p, li { color: var(--fg2); }
+ul { padding-left: 20px; }
+li { margin-bottom: 6px; }
+
+/* Cards */
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin: 16px 0; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+@media (max-width: 768px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+
+/* Mermaid */
+.mermaid { background: var(--bg2); border-radius: 12px; padding: 24px; margin: 16px 0; overflow-x: auto; display: flex; justify-content: center; }
+
+/* Charts */
+.chart-container { background: var(--bg2); border-radius: 12px; padding: 24px; margin: 16px 0; }
+.chart-container svg { width: 100%; }
+.axis path, .axis line { stroke: var(--border); }
+.axis text { fill: var(--fg2); font-size: 12px; }
+.line { fill: none; stroke-width: 2.5; }
+.area { opacity: 0.15; }
+.legend text { fill: var(--fg2); font-size: 12px; }
+
+/* Data flow */
+.data-flow { position: relative; padding: 20px 0; }
+.flow-step { display: flex; align-items: stretch; gap: 16px; margin: 12px 0; opacity: 0; transform: translateX(-20px); animation: slideIn .5s forwards; }
+.flow-step:nth-child(n) { animation-delay: calc(var(--i, 0) * 0.12s); }
+@keyframes slideIn { to { opacity: 1; transform: translateX(0); } }
+.flow-label { min-width: 140px; background: var(--bg3); border-radius: 8px; padding: 12px 16px; font-size: .9rem; display: flex; align-items: center; font-weight: 600; }
+.flow-desc { flex: 1; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; color: var(--fg2); font-size: .85rem; }
+.flow-arrow { display: flex; align-items: center; justify-content: center; min-width: 36px; color: var(--accent); font-size: 1.4rem; }
+
+/* Formula */
+.formula { background: var(--bg3); border-radius: 8px; padding: 16px 20px; margin: 12px 0; font-family: 'Fira Code', monospace; overflow-x: auto; }
+.formula .katex-display { margin: 0; }
+
+/* Table */
+table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: .9rem; }
+th { background: var(--bg3); color: var(--fg); padding: 10px 14px; text-align: left; border-bottom: 2px solid var(--border); }
+td { padding: 8px 14px; border-bottom: 1px solid var(--border); color: var(--fg2); }
+tr:hover td { background: rgba(88,166,255,0.05); }
+
+/* Code */
+code { background: var(--bg3); padding: 2px 6px; border-radius: 4px; font-family: 'Fira Code', monospace; font-size: .85em; color: var(--purple); }
+pre { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; overflow-x: auto; margin: 12px 0; }
+pre code { background: none; padding: 0; color: var(--fg); }
+
+/* Tooltip */
+.tip { position: relative; cursor: help; border-bottom: 1px dashed var(--accent); }
+.tip:hover::after { content: attr(data-tip); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: var(--bg3); color: var(--fg); padding: 6px 12px; border-radius: 6px; font-size: .8rem; white-space: nowrap; z-index: 10; border: 1px solid var(--border); }
+
+/* Attention heatmap */
+.heatmap-cell { transition: all .15s; cursor: pointer; }
+.heatmap-cell:hover { stroke: var(--accent); stroke-width: 2; }
+
+/* Tabs */
+.tab-bar { display: flex; gap: 4px; margin-bottom: 16px; }
+.tab-btn { padding: 8px 16px; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px 8px 0 0; color: var(--fg2); cursor: pointer; font-size: .85rem; transition: all .2s; }
+.tab-btn.active { background: var(--card); border-bottom-color: var(--card); color: var(--accent); }
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+
+/* Interactive widgets */
+.slider-row { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
+.slider-row label { min-width: 120px; color: var(--fg2); font-size: .85rem; }
+.slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+.slider-row .val { min-width: 50px; text-align: right; color: var(--accent); font-family: monospace; }
+.btn { background: var(--accent); color: var(--bg); border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: .85rem; transition: all .2s; }
+.btn:hover { filter: brightness(1.15); }
+.btn-outline { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+.btn-outline:hover { background: var(--accent); color: var(--bg); }
+
+/* Animated forward pass */
+.anim-container { position: relative; }
+.anim-stage { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; justify-content: center; padding: 16px 0; }
+.anim-block { background: var(--card); border: 2px solid var(--border); border-radius: 10px; padding: 14px 18px; text-align: center; min-width: 80px; transition: all .4s; }
+.anim-block.active { border-color: var(--accent); box-shadow: 0 0 20px rgba(88,166,255,0.3); transform: scale(1.05); }
+.anim-block .name { font-weight: 700; font-size: .9rem; color: var(--fg); }
+.anim-block .shape { font-size: .7rem; color: var(--fg2); font-family: monospace; margin-top: 4px; }
+
+/* Scroll animation */
+.reveal { opacity: 0; transform: translateY(30px); transition: all .6s ease; }
+.reveal.visible { opacity: 1; transform: translateY(0); }
+
+footer { text-align: center; color: var(--fg2); font-size: .8rem; padding: 40px 0; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<!-- Navigation -->
+<nav>
+  <div class="max-w">
+    <span class="brand">Transformer C</span>
+    <a href="#overview">概览</a>
+    <a href="#data-structures">数据结构</a>
+    <a href="#nn-math">数学引擎</a>
+    <a href="#attention">多头注意力</a>
+    <a href="#encoder-decoder">Encoder/Decoder</a>
+    <a href="#forward">前向传播</a>
+    <a href="#training">训练流程</a>
+    <a href="#inference">推理生成</a>
+    <a href="#tokenizer">分词器</a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<div class="hero max-w">
+  <h1>Transformer 纯 C 实现<br>架构原理交互式图解</h1>
+  <p>从一行代码到整个系统的运行——每个张量如何流动、每层梯度如何回传、KV Cache 如何将推理加速 490 倍。全部交互可视。</p>
+</div>
+
+<!-- ===== 1. Overview ===== -->
+<section id="overview" class="max-w">
+  <h2><span class="num">1</span>全局鸟瞰</h2>
+  <p>本项目在约 2000 行 C 代码中实现了完整的 Encoder-Decoder Transformer，外加分词器、训练循环和 KV Cache 推理。四大模块各司其职：</p>
+
+  <div class="mermaid">
+graph TB
+    subgraph 底层数学引擎
+        T[Tensor3D / Matrix 数据结构]
+        L[线性层 y=xW+b]
+        S[Softmax / LayerNorm / Dropout]
+        A[激活函数 ReLU GELU SiLU]
+        AD[Adam 优化器 + Warmup/Cosine]
+        LO[交叉熵 / MSE 损失]
+        MK[因果掩码 / 填充掩码]
+    end
+    subgraph 模型核心
+        MH[多头注意力 Wq Wk Wv Wo]
+        FF[前馈网络 W1 b1 W2 b2]
+        PE[正弦位置编码]
+        EL[编码器层 Pre-LN]
+        DL[解码器层 Pre-LN]
+        ENC[编码器 堆叠 N 层]
+        DEC[解码器 堆叠 N 层]
+        TR[Transformer 整体]
+        KV[KV Cache 增量解码]
+    end
+    subgraph 训练与推理
+        TS[TrainingState 参数注册]
+        GR[梯度裁剪 + Adam 更新]
+        ES[早停 + 最佳检查点]
+        TRN[训练循环]
+        GEN[自回归生成]
+    end
+    subgraph 工具
+        TK[Tokenizer char/byte/word/utf8]
+        CLI[main.c 命令行接口]
+        VIZ[visualize 可视化导出]
+    end
+
+    T --> L --> MH
+    S --> MH
+    A --> FF
+    PE --> ENC
+    PE --> DEC
+    MH --> EL --> ENC --> TR
+    MH --> DL --> DEC --> TR
+    FF --> EL
+    FF --> DL
+    TR --> TS --> GR --> TRN
+    TR --> KV --> GEN
+    LO --> TRN
+    TK --> TRN
+    TK --> GEN
+    CLI --> TRN
+    CLI --> GEN
+    MK --> MH
+
+    style T fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    style MH fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+    style TR fill:#5f1f2f,stroke:#f85149,color:#e6edf3
+    style KV fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+  </div>
+
+  <div class="card">
+    <h4>整体数据流一句话版</h4>
+    <p><code>文本 → Tokenizer → token IDs → Embedding查表 → + PE → Encoder → Decoder → Logit投影 → Softmax → 采样 → 文本</code></p>
+    <p>如果错了就反向： <code>Loss → ∂L/∂logits → Backward through Decoder → Backward through Encoder → ∂L/∂Embedding(散点加法) → Adam更新权重</code></p>
+  </div>
+</section>
+
+<!-- ===== 2. Data Structures ===== -->
+<section id="data-structures" class="max-w">
+  <h2><span class="num">2</span>数据结构</h2>
+
+  <div class="grid-2">
+    <div class="card">
+      <h4>Tensor3D — 三维张量</h4>
+      <pre><code>typedef struct {
+    int batch_size;  // 批次
+    int seq_len;     // 序列长度
+    int d_model;     // 隐藏维度
+    float *data;     // 行优先连续内存
+} Tensor3D;</code></pre>
+      <p style="margin-top:8px">想象一本笔记本：batch_size 本，每本 seq_len 页，每页 d_model 个格子。</p>
+      <div class="formula" id="f-tensor3d"></div>
+    </div>
+    <div class="card">
+      <h4>Matrix — 权重矩阵</h4>
+      <pre><code>typedef struct {
+    int rows;    // 输出维度
+    int cols;    // 输入维度
+    float *data; // 行优先
+} Matrix;</code></pre>
+      <p style="margin-top:8px">所有线性层统一约定：<code>y = x @ W<sup>T</sup></code>，W 形状 (out, in)。</p>
+      <div class="formula" id="f-linear"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h4>TransformerConfig — 模型配置单</h4>
+    <table>
+      <tr><th>字段</th><th>含义</th><th>典型值</th></tr>
+      <tr><td><code>d_model</code></td><td>隐藏维度（模型宽度）</td><td>64 / 128 / 512</td></tr>
+      <tr><td><code>num_heads</code></td><td>注意力头数</td><td>4 / 8</td></tr>
+      <tr><td><code>d_ff</code></td><td>FFN 中间维度</td><td>256 / 2048</td></tr>
+      <tr><td><code>encoder_layers</code></td><td>编码器层数</td><td>1-6</td></tr>
+      <tr><td><code>decoder_layers</code></td><td>解码器层数</td><td>1-6</td></tr>
+      <tr><td><code>max_len</code></td><td>最大序列长度</td><td>64-512</td></tr>
+      <tr><td><code>vocab_size</code></td><td>词表大小（0=传统路径）</td><td>28-500+</td></tr>
+      <tr><td><code>activation</code></td><td>激活函数类型</td><td>GELU</td></tr>
+    </table>
+  </div>
+
+  <div class="grid-2" style="margin-top:16px">
+    <div class="card">
+      <h4>MultiHeadAttention</h4>
+      <pre><code>Wq, Wk, Wv, Wo   // 各 (d_model, d_model)
+num_heads          // 注意力头数
+head_dim           // = d_model / num_heads</code></pre>
+      <p>四把钥匙：Wq="我要找什么"，Wk="我有什么特征"，Wv="我的内容"，Wo="缝合多头结果"。</p>
+    </div>
+    <div class="card">
+      <h4>FeedForward</h4>
+      <pre><code>W1   (d_model, d_ff)    // 升维
+b1   (1, d_ff)
+W2   (d_ff, d_model)    // 降维
+b2   (1, d_model)
+activation               // GELU/R etLU/SiLU</code></pre>
+      <p>漏斗：先放大到 d_ff 维，激活，再缩回 d_model 维。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 3. nn_math ===== -->
+<section id="nn-math" class="max-w">
+  <h2><span class="num">3</span>底层数学引擎 nn_math</h2>
+
+  <h3>3.1 线性层 y = x @ W<sup>T</sup></h3>
+  <div class="mermaid">
+graph LR
+    X["输入 x<br/>(B, S, in_dim)"] --> MUL["x @ Wᵀ"]
+    W["权重 W<br/>(out_dim, in_dim)"] --> MUL
+    MUL --> Y["输出 y<br/>(B, S, out_dim)"]
+    style X fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    style W fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+    style Y fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+  </div>
+  <p>反向传播计算 <code>dW</code>（权重梯度）和 <code>dx</code>（输入梯度）。自注意力中 Q/K/V 共享同一输入，需要 <code>linear_backward_accum</code> 累加梯度到同一 buffer。</p>
+
+  <h3>3.2 激活函数</h3>
+  <div id="activation-chart" class="chart-container"></div>
+  <div class="slider-row">
+    <label>查看范围</label>
+    <input type="range" id="act-range" min="2" max="8" value="4" step="0.5">
+    <span class="val" id="act-range-val">±4</span>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+    <label style="color:var(--fg2);font-size:.85rem"><input type="checkbox" checked data-act="relu"> ReLU</label>
+    <label style="color:var(--fg2);font-size:.85rem"><input type="checkbox" checked data-act="gelu"> GELU</label>
+    <label style="color:var(--fg2);font-size:.85rem"><input type="checkbox" checked data-act="silu"> SiLU</label>
+    <label style="color:var(--fg2);font-size:.85rem"><input type="checkbox" data-act="sigmoid"> Sigmoid(对照)</label>
+  </div>
+
+  <h3>3.3 Softmax 与 LayerNorm</h3>
+  <div class="grid-2">
+    <div class="card">
+      <h4>Softmax（数值稳定版）</h4>
+      <div class="formula" id="f-softmax"></div>
+      <p>反向：<code>dx[i] = y[i] * (dy[i] - Σ dy[j]*y[j])</code></p>
+      <p>直觉：每个输入的梯度不光看"自己那份"，还要减去"全局加权平均"。</p>
+    </div>
+    <div class="card">
+      <h4>LayerNorm（token 内归一化）</h4>
+      <div class="formula" id="f-layernorm"></div>
+      <p>Pre-LN：LN 在子模块之前；Post-LN：LN 在残差之后。本项目用 <strong>Pre-LN</strong>。</p>
+    </div>
+  </div>
+
+  <h3>3.4 学习率调度（Warmup + Cosine Decay）</h3>
+  <div id="lr-schedule-chart" class="chart-container"></div>
+  <div style="margin-top:12px" class="grid-3">
+    <div class="slider-row">
+      <label>Warmup 步数</label>
+      <input type="range" id="lr-warmup" min="0" max="50" value="10">
+      <span class="val" id="lr-warmup-val">10</span>
+    </div>
+    <div class="slider-row">
+      <label>总步数</label>
+      <input type="range" id="lr-total" min="50" max="500" value="200">
+      <span class="val" id="lr-total-val">200</span>
+    </div>
+    <div class="slider-row">
+      <label>最低因子</label>
+      <input type="range" id="lr-min" min="1" max="30" value="10">
+      <span class="val" id="lr-min-val">0.10</span>
+    </div>
+  </div>
+
+  <h3>3.5 掩码可视化</h3>
+  <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;margin-top:12px">
+    <div>
+      <h4 style="text-align:center">因果掩码 (seq_len=8)</h4>
+      <div id="causal-mask-chart" class="chart-container" style="padding:12px"></div>
+      <p style="font-size:.8rem;color:var(--fg2);text-align:center">下三角：位置 q 只能看到 ≤ q 的位置</p>
+    </div>
+    <div>
+      <h4 style="text-align:center">Softmax 后注意力权重</h4>
+      <div id="softmax-attn-chart" class="chart-container" style="padding:12px"></div>
+      <p style="font-size:.8rem;color:var(--fg2);text-align:center">未来位置的权重趋近 0</p>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 4. Multi-Head Attention ===== -->
+<section id="attention" class="max-w">
+  <h2><span class="num">4</span>多头注意力 — 核心组件详解</h2>
+
+  <h3>4.1 整体流程</h3>
+  <div class="mermaid">
+graph TD
+    Q_in["Query 输入<br/>(B, Sq, d)"] --> Q["Q = Q_in @ Wq<br/>(B, Sq, d)"]
+    K_in["Key 输入<br/>(B, Skv, d)"] --> K["K = K_in @ Wk<br/>(B, Skv, d)"]
+    V_in["Value 输入<br/>(B, Skv, d)"] --> V["V = V_in @ Wv<br/>(B, Skv, d)"]
+    Q --> Split1["split_heads<br/>(B, h, Sq, d/h)"]
+    K --> Split2["split_heads<br/>(B, h, Skv, d/h)"]
+    V --> Split3["split_heads<br/>(B, h, Skv, d/h)"]
+    Split1 --> Dot["scores = Q · Kᵀ / √(d/h)<br/>形状: (B, h, Sq, Skv)"]
+    Split2 --> Dot
+    Dot --> Mask["+ Mask<br/>(因果/填充)"]
+    Mask --> SM["Softmax<br/>沿 kv_len 维度"]
+    Split3 --> Attn["attended = weights @ V<br/>(B, h, Sq, d/h)"]
+    SM --> Attn
+    Attn --> Merge["merge_heads<br/>(B, Sq, d)"]
+    Merge --> Out["output = merged @ Wo<br/>(B, Sq, d)"]
+
+    style Q_in fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    style K_in fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    style V_in fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    style Out fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    style SM fill:#5f3b1f,stroke:#d29922,color:#e6edf3
+    style Dot fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+  </div>
+
+  <h3>4.2 交互式注意力热图</h3>
+  <p>模拟一个 4 头注意力在 seq_len=8 上的权重分布。调整参数观察变化：</p>
+  <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px">
+    <div class="slider-row">
+      <label>序列长度</label>
+      <input type="range" id="attn-seq-len" min="4" max="16" value="8">
+      <span class="val" id="attn-seq-len-val">8</span>
+    </div>
+    <div class="slider-row">
+      <label>注意力头</label>
+      <input type="range" id="attn-head" min="0" max="3" value="0">
+      <span class="val" id="attn-head-val">0</span>
+    </div>
+    <div class="slider-row">
+      <label>温度</label>
+      <input type="range" id="attn-temp" min="1" max="20" value="5">
+      <span class="val" id="attn-temp-val">0.5</span>
+    </div>
+  </div>
+  <div id="attention-heatmap" class="chart-container" style="padding:0"></div>
+  <div style="display:flex;gap:16px;margin-top:12px">
+    <div style="flex:1">
+      <h4>自注意力 (Self-Attention)</h4>
+      <div id="self-attn-heatmap" class="chart-container" style="padding:0"></div>
+    </div>
+    <div style="flex:1">
+      <h4>交叉注意力 (Cross-Attention)</h4>
+      <div id="cross-attn-heatmap" class="chart-container" style="padding:0"></div>
+    </div>
+  </div>
+
+  <h3>4.3 反向传播</h3>
+  <div class="mermaid">
+graph TD
+    dY["∂L/∂output<br/>(B, S, d)"] --> dMerged["∂L/∂merged = dY @ Woᵀ"]
+    dY --> dWo["∂L/∂Wo = mergedᵀ · dY"]
+    dMerged --> dAttn["∂L/∂attended (split_heads)"]
+    dAttn --> dWeights["∂L/∂weights = ∂L/∂attn · Vᵀ"]
+    dAttn --> dV["∂L/∂V += weightsᵀ · ∂L/∂attn"]
+    dWeights --> dScores["∂L/∂scores (softmax bwd)<br/>dxi = yi(dyi - Σ·dyj·yj)"]
+    dScores --> dQheads["∂L/∂Q_h = dScores · K / √(d/h)"]
+    dScores --> dKheads["∂L/∂K_h = dScoresᵀ · Q / √(d/h)"]
+    dQheads --> dQ["∂L/∂Q (merge_heads) → ∂L/∂input"]
+    dKheads --> dK["∂L/∂K (merge_heads) → ∂L/∂input"]
+    dV --> dV2["∂L/∂V (merge_heads) → ∂L/∂input"]
+
+    dQ --> dIn["别名检测：∂L/∂input = dQ + dK + dV"]
+
+    style dY fill:#5f1f2f,stroke:#f85149,color:#e6edf3
+    style dIn fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    style dScores fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+  </div>
+  <div class="card">
+    <p><strong>别名检测（Aliasing）</strong>：自注意力中 Q/K/V 来自同一输入，所以 <code>dQ + dK + dV</code> 要累加到同一个 buffer 而非覆写。交叉注意力中 K 和 V 共享 <code>encoder_out</code>，梯度同样需要累加。</p>
+  </div>
+</section>
+
+<!-- ===== 5. Encoder/Decoder ===== -->
+<section id="encoder-decoder" class="max-w">
+  <h2><span class="num">5</span>Encoder / Decoder 层详解</h2>
+
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="enc">编码器层 (Pre-LN)</button>
+    <button class="tab-btn" data-tab="dec">解码器层 (Pre-LN)</button>
+    <button class="tab-btn" data-tab="compare">Pre-LN vs Post-LN</button>
+  </div>
+
+  <div class="tab-pane active" id="tab-enc">
+    <div class="mermaid">
+graph TD
+    X["输入 x"] --> LN1["LayerNorm 1"]
+    LN1 --> SA["Self-Attention<br/>(看自己全部位置)"]
+    SA --> ADD1["+ 残差"]
+    X --> ADD1
+    ADD1 --> Y1["y1 = x + Attn(LN(x))"]
+    Y1 --> LN2["LayerNorm 2"]
+    LN2 --> FFN["Feed-Forward<br/>W1 → GELU → W2"]
+    FFN --> ADD2["+ 残差"]
+    Y1 --> ADD2
+    ADD2 --> Y2["y2 = y1 + FFN(LN(y1))"]
+
+    style X fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    style Y2 fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    style LN1 fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+    style LN2 fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+    style SA fill:#5f3b1f,stroke:#d29922,color:#e6edf3
+    style FFN fill:#5f1f2f,stroke:#f85149,color:#e6edf3
+    style ADD1 fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    style ADD2 fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    </div>
+    <div class="card">
+      <h4>参数清单</h4>
+      <table>
+        <tr><th>参数</th><th>形状</th><th>用途</th></tr>
+        <tr><td><code>ln1_gamma, ln1_beta</code></td><td>(1, d)</td><td>Self-Attn 前的 LayerNorm</td></tr>
+        <tr><td><code>Wq, Wk, Wv, Wo</code></td><td>(d, d) × 4</td><td>Self-Attention 投影</td></tr>
+        <tr><td><code>ln2_gamma, ln2_beta</code></td><td>(1, d)</td><td>FFN 前的 LayerNorm</td></tr>
+        <tr><td><code>W1, b1</code></td><td>(d, d<sub>ff</sub>)</td><td>FFN 升维 + 偏置</td></tr>
+        <tr><td><code>W2, b2</code></td><td>(d<sub>ff</sub>, d)</td><td>FFN 降维 + 偏置</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="tab-pane" id="tab-dec">
+    <div class="mermaid">
+graph TD
+    X["输入 x<br/>(已生成序列)"] --> LN1["LayerNorm 1"]
+    LN1 --> SA["Self-Attention<br/>(因果掩码！)"]
+    SA --> ADD1["+ 残差"]
+    X --> ADD1
+    ADD1 --> Y1["y1"]
+    Y1 --> LN2["LayerNorm 2"]
+    LN2 --> CA["Cross-Attention<br/>Q=y1, K=V=encoder_out"]
+    ENC["encoder_out"] --> CA
+    CA --> ADD2["+ 残差"]
+    Y1 --> ADD2
+    ADD2 --> Y2["y2"]
+    Y2 --> LN3["LayerNorm 3"]
+    LN3 --> FFN["FFN"]
+    FFN --> ADD3["+ 残差"]
+    Y2 --> ADD3
+    ADD3 --> Y3["y3 = y2 + FFN(LN(y2))"]
+
+    style X fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    style ENC fill:#5f1f3b,stroke:#f85149,color:#e6edf3
+    style Y3 fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    style LN1 fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+    style LN2 fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+    style LN3 fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+    style SA fill:#5f3b1f,stroke:#d29922,color:#e6edf3
+    style CA fill:#5f1f3b,stroke:#f85149,color:#e6edf3
+    </div>
+    <div class="card">
+      <h4>解码器层比编码器层多什么？</h4>
+      <ul>
+        <li><strong>多一组 Cross-Attention</strong>：Q 来自解码器，K/V 来自编码器输出</li>
+        <li><strong>多一组 LN</strong>：<code>ln3_gamma / ln3_beta</code></li>
+        <li><strong>自注意力带因果掩码</strong>：只能看当前位置及之前的位置</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="tab-pane" id="tab-compare">
+    <div class="grid-2">
+      <div class="card">
+        <h4>Pre-LN（本项目使用）</h4>
+        <div class="formula" id="f-preln"></div>
+        <ul>
+          <li>LN 在子模块 <strong>之前</strong></li>
+          <li>残差连接的梯度路径更短</li>
+          <li>训练更稳定，不需要 warmup</li>
+          <li>GPT-2、LLaMA 等现代模型的选择</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h4>Post-LN（原始论文）</h4>
+        <div class="formula" id="f-postln"></div>
+        <ul>
+          <li>LN 在残差 <strong>之后</strong></li>
+          <li>梯度要穿过 LN 才能走捷径</li>
+          <li>训练早期梯度不稳定</li>
+          <li>需要 learning rate warmup</li>
+        </ul>
+      </div>
+    </div>
+    <div id="prenorm-chart" class="chart-container" style="margin-top:16px"></div>
+    <p style="color:var(--fg2);font-size:.85rem;text-align:center;margin-top:8px">梯度流示意：Pre-LN 的残差路径（绿色虚线）没有 LN 阻碍，梯度直接传递。</p>
+  </div>
+</section>
+
+<!-- ===== 6. Forward Pass ===== -->
+<section id="forward" class="max-w">
+  <h2><span class="num">6</span>前向传播 — 从 Token 到 Logit</h2>
+
+  <div class="anim-container" id="forward-anim">
+    <div class="anim-stage">
+      <div class="anim-block" data-step="1"><div class="name">Token IDs</div><div class="shape">(B, S) ints</div></div>
+      <div class="flow-arrow">→</div>
+      <div class="anim-block" data-step="2"><div class="name">Embedding</div><div class="shape">(B, S, d_model)</div></div>
+      <div class="flow-arrow">+</div>
+      <div class="anim-block" data-step="3"><div class="name">PE</div><div class="shape">(S, d_model)</div></div>
+      <div class="flow-arrow">=</div>
+      <div class="anim-block" data-step="4"><div class="name">src_input</div><div class="shape">(B, S<sub>src</sub>, d)</div></div>
+    </div>
+    <div class="anim-stage">
+      <div class="anim-block" data-step="5" style="border-color:var(--accent)"><div class="name">Encoder</div><div class="shape">N × (Self-Attn + FFN)</div></div>
+      <div class="flow-arrow">→</div>
+      <div class="anim-block" data-step="6"><div class="name">encoder_out</div><div class="shape">(B, S<sub>src</sub>, d)</div></div>
+    </div>
+    <div class="anim-stage">
+      <div class="anim-block" data-step="7"><div class="name">tgt Embed + PE</div><div class="shape">(B, S<sub>tgt</sub>, d)</div></div>
+      <div class="flow-arrow">→</div>
+      <div class="anim-block" data-step="8" style="border-color:var(--orange)"><div class="name">Decoder</div><div class="shape">N × (Self + Cross + FFN)</div></div>
+      <div class="flow-arrow">→</div>
+      <div class="anim-block" data-step="9"><div class="name">decoder_out</div><div class="shape">(B, S<sub>tgt</sub>, d)</div></div>
+    </div>
+    <div class="anim-stage">
+      <div class="anim-block" data-step="10"><div class="name">Logit Head</div><div class="shape">(d, vocab)</div></div>
+      <div class="flow-arrow">→</div>
+      <div class="anim-block" data-step="11" style="border-color:var(--green)"><div class="name">logits</div><div class="shape">(B, S<sub>tgt</sub>, vocab)</div></div>
+    </div>
+  </div>
+
+  <div style="text-align:center;margin:16px 0">
+    <button class="btn" id="fwd-play-btn">▶ 播放前向传播</button>
+  </div>
+
+  <h3>位置编码详解</h3>
+  <div id="pe-chart" class="chart-container"></div>
+  <div class="grid-2" style="margin-top:8px">
+    <div class="slider-row">
+      <label>d_model</label>
+      <input type="range" id="pe-dim" min="16" max="128" value="64" step="16">
+      <span class="val" id="pe-dim-val">64</span>
+    </div>
+    <div class="slider-row">
+      <label>序列长度</label>
+      <input type="range" id="pe-len" min="8" max="64" value="32" step="4">
+      <span class="val" id="pe-len-val">32</span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h4>Embedding 梯度是散点加法</h4>
+    <p>Embedding 的梯度不像权重矩阵那样是矩阵乘法——只有 <strong>被查表查到的行</strong> 才有梯度：</p>
+    <pre><code>for each (b, s):
+    grad_embedding[src_ids[b][s]] += grad_encoder_input[b][s]</code></pre>
+    <p>这就像一本字典：只有翻到的页才有修改记录，其余页原封不动。</p>
+  </div>
+</section>
+
+<!-- ===== 7. Training ===== -->
+<section id="training" class="max-w">
+  <h2><span class="num">7</span>训练全流程</h2>
+
+  <div class="mermaid">
+graph TD
+    START["开始 epoch"] --> SHUFFLE["打乱窗口顺序<br/>(Fisher-Yates)"]
+    SHUFFLE --> BATCH["取 batch_size 个窗口<br/>src_ids, tgt_ids"]
+    BATCH --> ZERO["清零梯度<br/>(training_state_zero_grads)"]
+    ZERO --> FWD["前向传播<br/>transformer_forward_lm"]
+    FWD --> LOSS["计算损失<br/>cross_entropy_loss + 准确率"]
+    LOSS --> BWD["反向传播<br/>transformer_backward_lm"]
+    BWD --> CLIP["梯度裁剪<br/>norm ≤ 1.0"]
+    CLIP --> ADAM["Adam 更新<br/>training_state_update"]
+    ADAM --> MORE{还有 batch?}
+    MORE -->|是| BATCH
+    MORE -->|否| AVG["计算 avg_loss, avg_acc"]
+    AVG --> IMPROVE{loss 改善?}
+    IMPROVE -->|是| SAVE["保存最佳检查点<br/>重置耐心"]
+    IMPROVE -->|否| PATIENT["耐心 -1"]
+    SAVE --> EARLY{早停?}
+    PATIENT --> EARLY
+    EARLY -->|否| START
+    EARLY -->|是| DONE["训练结束"]
+
+    style START fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    style DONE fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    style LOSS fill:#5f3b1f,stroke:#d29922,color:#e6edf3
+    style CLIP fill:#5f1f3b,stroke:#f85149,color:#e6edf3
+    style ADAM fill:#3b1f5f,stroke:#bc8cff,color:#e6edf3
+  </div>
+
+  <h3>梯度裁剪</h3>
+  <div class="formula" id="f-gradclip"></div>
+  <p>直觉：给梯度装"限速器"——梯度太大就等比缩放，防止一步跨太远导致训练崩溃。</p>
+
+  <h3>训练损失曲线（典型）</h3>
+  <div id="loss-chart" class="chart-container"></div>
+</section>
+
+<!-- ===== 8. Inference ===== -->
+<section id="inference" class="max-w">
+  <h2><span class="num">8</span>推理与生成</h2>
+
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="nocache">朴素方法 O(n²)</button>
+    <button class="tab-btn" data-tab="kvcache">KV Cache O(n)</button>
+  </div>
+
+  <div class="tab-pane active" id="tab-nocache">
+    <div class="mermaid">
+graph TD
+    SEED["seed_ids"] --> ENC1["Encoder<br/>(第1次)"] --> DEC1["Decoder<br/>(全长序列)"] --> TOK1["采样 token1"]
+    TOK1 --> |"context = seed + tok1"| ENC2["Encoder<br/>(第2次)"] --> DEC2["Decoder<br/>(全长序列+1)"] --> TOK2["采样 token2"]
+    TOK2 --> |"context += tok2"| ENC3["Encoder<br/>(第3次)"] --> DEC3["Decoder<br/>(全长序列+2)"] --> TOK3["采样 token3"]
+    TOK3 --> |"..."| MORE["..."]
+
+    style ENC1 fill:#5f1f3b,stroke:#f85149,color:#e6edf3
+    style ENC2 fill:#5f1f3b,stroke:#f85149,color:#e6edf3
+    style ENC3 fill:#5f1f3b,stroke:#f85149,color:#e6edf3
+    </div>
+    <div class="card">
+      <p><strong>问题</strong>：每生成一个 token 都要重跑完整 Encoder + Decoder。总计算量 = O(1 + 2 + ... + N) = O(N²)。</p>
+    </div>
+  </div>
+
+  <div class="tab-pane" id="tab-kvcache">
+    <div class="mermaid">
+graph TD
+    SEED["seed_ids"] --> INIT["Encoder + 预投影<br/>(只跑一次!)"]
+    INIT --> KV_CROSS["cross_k / cross_v<br/>(缓存编码器输出)"]
+    INIT --> STEP1["Decoder Step 1<br/>(只有新 token)"]
+    KV_CROSS --> |"K/V 复用"| STEP1
+    STEP1 --> TOK1["采样 token1"]
+    TOK1 --> STEP2["Decoder Step 2<br/>(只有新 token)"]
+    KV_CROSS --> |"K/V 复用"| STEP2
+    STEP2 --> SAM["自注意力 K/V 追加到 cache"]
+    SAM --> TOK2["采样 token2"]
+    TOK2 --> STEP3["Decoder Step 3<br/>(只有新 token)"]
+    STEP3 --> MORE["..."]
+
+    style INIT fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    style KV_CROSS fill:#1f5f3b,stroke:#3fb950,color:#e6edf3
+    style SAM fill:#1c3a5f,stroke:#58a6ff,color:#e6edf3
+    </div>
+    <div class="card">
+      <p><strong>关键</strong>：编码器只跑一次，cross-attention 的 K/V 预投影后缓存。每步只跑一个新 token 的 decoder step（O(1)），不再重算历史。总计算量 = O(N)。</p>
+    </div>
+
+    <h4>加速比实测</h4>
+    <div id="speedup-chart" class="chart-container"></div>
+    <table style="margin-top:12px">
+      <tr><th>生成长度</th><th>无缓存</th><th>KV Cache</th><th>加速比</th></tr>
+      <tr><td>50</td><td>0.118s</td><td>0.002s</td><td>54×</td></tr>
+      <tr><td>100</td><td>0.250s</td><td>0.002s</td><td>106×</td></tr>
+      <tr><td>200</td><td>0.520s</td><td>0.002s</td><td>228×</td></tr>
+      <tr><td>400</td><td>1.077s</td><td>0.002s</td><td>490×</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ===== 9. Tokenizer ===== -->
+<section id="tokenizer" class="max-w">
+  <h2><span class="num">9</span>分词器 Tokenizer</h2>
+
+  <div class="grid-2">
+    <div class="card">
+      <h4>四种模式</h4>
+      <table>
+        <tr><th>模式</th><th>描述</th><th>词表大小</th></tr>
+        <tr><td><code>char</code></td><td>指定字符集，可自动小写</td><td>4 + |charset|</td></tr>
+        <tr><td><code>byte</code></td><td>256 字节级，UTF-8 安全</td><td>260</td></tr>
+        <tr><td><code>word</code></td><td>按词频从语料构建</td><td>≤ max_vocab</td></tr>
+        <tr><td><code>utf8</code></td><td>每个 Unicode 码点一个 token</td><td>4 + 唯一码点数</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h4>特殊 Token</h4>
+      <table>
+        <tr><th>ID</th><th>Token</th><th>用途</th></tr>
+        <tr><td>0</td><td><code>&lt;pad&gt;</code></td><td>填充</td></tr>
+        <tr><td>1</td><td><code>&lt;unk&gt;</code></td><td>未知字符</td></tr>
+        <tr><td>2</td><td><code>&lt;bos&gt;</code></td><td>序列开头</td></tr>
+        <tr><td>3</td><td><code>&lt;eos&gt;</code></td><td>序列结尾</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>编码示例</h3>
+  <div class="card">
+    <div id="tokenizer-demo" style="margin-top:8px">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+        <input type="text" id="tok-input" value="你好hello" placeholder="输入文本..." style="flex:1;padding:8px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:.9rem">
+        <select id="tok-mode" style="padding:8px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--fg)">
+          <option value="utf8">UTF-8</option>
+          <option value="char">Char (a-z)</option>
+          <option value="byte">Byte</option>
+        </select>
+      </div>
+      <div id="tok-output" style="font-family:monospace;line-height:2;color:var(--fg2)"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Footer ===== -->
+<footer class="max-w">
+  <p>Transformer 纯 C 实现 — 交互式架构图解 | 数据来自源码分析 | 2026</p>
+</footer>
+
+<!-- ===== Scripts ===== -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  if (typeof mermaid !== 'undefined') {
+    mermaid.initialize({startOnLoad:false,theme:'dark',themeVariables:{primaryColor:'#1c3a5f',primaryTextColor:'#e6edf3',primaryBorderColor:'#58a6ff',lineColor:'#8b949e',secondaryColor:'#1f2d3d',tertiaryColor:'#21262d'}});
+    mermaid.run({nodes: document.querySelectorAll('#overview .mermaid, #nn-math .mermaid, #attention .mermaid, #training .mermaid, #tab-enc .mermaid, #tab-nocache .mermaid')});
+  }
+  if (typeof d3 === 'undefined') {
+    document.querySelectorAll('.chart-container').forEach(el => { el.innerHTML = '<p style="color:#f85149;text-align:center;padding:40px">D3.js 加载失败，请检查网络连接后刷新页面。</p>'; });
+    return;
+  }
+
+/* ====== Tab switching ====== */
+const drawnTabs = new Set(['enc', 'nocache']);
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const parent = btn.parentElement;
+    const paneId = btn.getAttribute('data-tab');
+    parent.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const section = btn.closest('section') || btn.closest('.max-w');
+    section.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+    const target = section.querySelector('#tab-' + paneId);
+    if (target) target.classList.add('active');
+    if (!drawnTabs.has(paneId)) {
+      drawnTabs.add(paneId);
+      if (typeof mermaid !== 'undefined') {
+        setTimeout(() => mermaid.run({ nodes: target.querySelectorAll('.mermaid') }), 50);
+      }
+      if (target.id === 'tab-compare') setTimeout(drawPreNorm, 50);
+      if (target.id === 'tab-kvcache') setTimeout(drawSpeedup, 50);
+    }
+  });
+});
+
+/* ====== Activation Functions ====== */
+function drawActivations() {
+  const rangeVal = parseFloat(document.getElementById('act-range').value);
+  document.getElementById('act-range-val').textContent = '\u00B1' + rangeVal;
+
+  const checks = {};
+  document.querySelectorAll('[data-act]').forEach(cb => { checks[cb.dataset.act] = cb.checked; });
+
+  const margin = {top: 20, right: 30, bottom: 30, left: 50};
+  const width = 800 - margin.left - margin.right;
+  const height = 350 - margin.top - margin.bottom;
+
+  const svg = d3.select('#activation-chart').html('').append('svg')
+    .attr('width', width + margin.left + margin.right)
+    .attr('height', height + margin.top + margin.bottom)
+    .append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const x = d3.scaleLinear().domain([-rangeVal, rangeVal]).range([0, width]);
+  const y = d3.scaleLinear().domain([-1.5, rangeVal * 1.2]).range([height, 0]);
+
+  svg.append('g').attr('class','axis').attr('transform',`translate(0,${height})`).call(d3.axisBottom(x));
+  svg.append('g').attr('class','axis').call(d3.axisLeft(y));
+
+  const n = 400;
+  const xs = Array.from({length:n}, (_,i) => -rangeVal + 2*rangeVal*i/(n-1));
+
+  const sigmoid = x => 1/(1+Math.exp(-x));
+  const relu = x => Math.max(0, x);
+  const gelu = x => 0.5 * x * (1 + Math.tanh(Math.sqrt(2/Math.PI) * (x + 0.044715*x*x*x)));
+  const silu = x => x * sigmoid(x);
+
+  const funcs = {
+    relu: {fn: relu, color: '#58a6ff', name: 'ReLU', deriv: x => x > 0 ? 1 : 0},
+    gelu: {fn: gelu, color: '#3fb950', name: 'GELU', deriv: x => { const a=Math.SQRT2; const s=x/a; const t=Math.abs(s); const p=1/(1+0.3275911*t); const erf=1-p*(0.254829592+p*(-0.284496736+p*(1.421413741+p*(-1.453152027+p*1.061405429))))*Math.exp(-t*t); const erfx=s<0?-erf:erf; const cdf=0.5*(1+erfx); const pdf=Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI); return x*pdf+cdf; }},
+    silu: {fn: silu, color: '#d29922', name: 'SiLU', deriv: x => { const s = sigmoid(x); return s*(1+x*(1-s)); }},
+    sigmoid: {fn: sigmoid, color: '#f85149', name: 'Sigmoid', deriv: x => sigmoid(x)*(1-sigmoid(x))}
+  };
+
+  Object.entries(funcs).forEach(([k, {fn, color, name}]) => {
+    if (!checks[k]) return;
+    const line = d3.line().x(d => x(d)).y(d => y(fn(d))).curve(d3.curveBasis);
+    svg.append('path').datum(xs).attr('d', line).attr('fill','none').attr('stroke', color).attr('stroke-width', 2.5);
+    svg.append('text').attr('x', width - 8).attr('y', y(fn(rangeVal-0.3))).attr('text-anchor','end').attr('fill', color).attr('font-size','12px').text(name);
+
+    const derivLine = d3.line().x(d => x(d)).y(d => y(funcs[k].deriv(d))).curve(d3.curveBasis);
+    svg.append('path').datum(xs).attr('d', derivLine).attr('fill','none').attr('stroke', color).attr('stroke-width', 1).attr('stroke-dasharray','4,3').attr('opacity', 0.5);
+  });
+
+  svg.append('text').attr('x', width/2).attr('y', -5).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','13px').text('实线=前向，虚线=导数');
+}
+document.getElementById('act-range').addEventListener('input', drawActivations);
+document.querySelectorAll('[data-act]').forEach(cb => cb.addEventListener('change', drawActivations));
+drawActivations();
+
+/* ====== Learning Rate Schedule ====== */
+function drawLRSchedule() {
+  const warmup = parseInt(document.getElementById('lr-warmup').value);
+  const total = parseInt(document.getElementById('lr-total').value);
+  const minFactor = parseInt(document.getElementById('lr-min').value) / 100;
+  document.getElementById('lr-warmup-val').textContent = warmup;
+  document.getElementById('lr-total-val').textContent = total;
+  document.getElementById('lr-min-val').textContent = minFactor.toFixed(2);
+
+  const margin = {top: 20, right: 30, bottom: 30, left: 50};
+  const width = 800 - margin.left - margin.right;
+  const height = 300 - margin.top - margin.bottom;
+  const decay = total - warmup;
+
+  const svg = d3.select('#lr-schedule-chart').html('').append('svg')
+    .attr('width', width + margin.left + margin.right)
+    .attr('height', height + margin.top + margin.bottom)
+    .append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const x = d3.scaleLinear().domain([0, total]).range([0, width]);
+  const y = d3.scaleLinear().domain([0, 1.1]).range([height, 0]);
+
+  svg.append('g').attr('class','axis').attr('transform',`translate(0,${height})`).call(d3.axisBottom(x));
+  svg.append('g').attr('class','axis').call(d3.axisLeft(y).tickFormat(d3.format('.1f')));
+
+  const data = Array.from({length: total}, (_, i) => {
+    let factor;
+    if (warmup > 0 && i < warmup) factor = i / warmup;
+    else if (decay > 0 && i <= warmup + decay) {
+      const t = (i - warmup) / decay;
+      factor = minFactor + (1 - minFactor) * 0.5 * (1 + Math.cos(Math.PI * t));
+    } else factor = minFactor;
+    return {step: i, factor};
+  });
+
+  const area = d3.area().x(d => x(d.step)).y0(height).y1(d => y(d.factor)).curve(d3.curveStep);
+  svg.append('path').datum(data).attr('d', area).attr('fill', 'rgba(88,166,255,0.1)');
+  const line = d3.line().x(d => x(d.step)).y(d => y(d.factor)).curve(d3.curveStep);
+  svg.append('path').datum(data).attr('d', line).attr('fill','none').attr('stroke','var(--accent)').attr('stroke-width', 2.5);
+
+  if (warmup > 0) {
+    svg.append('line').attr('x1', x(warmup)).attr('y1', 0).attr('x2', x(warmup)).attr('y2', height)
+      .attr('stroke','var(--orange)').attr('stroke-dasharray','5,3').attr('stroke-width', 1.5);
+    svg.append('text').attr('x', x(warmup)+5).attr('y', 15).attr('fill','var(--orange)').attr('font-size','11px').text('warmup ends');
+  }
+  svg.append('text').attr('x', width/2).attr('y', height+25).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','11px').text('Adam step');
+  svg.append('text').attr('x', -height/2).attr('y', -35).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','11px').attr('transform','rotate(-90)').text('schedule factor');
+}
+document.getElementById('lr-warmup').addEventListener('input', drawLRSchedule);
+document.getElementById('lr-total').addEventListener('input', drawLRSchedule);
+document.getElementById('lr-min').addEventListener('input', drawLRSchedule);
+drawLRSchedule();
+
+/* ====== Causal Mask Heatmap ====== */
+function drawCausalMask() {
+  const n = 8;
+  const size = 280, cellSize = size / n;
+  const svg = d3.select('#causal-mask-chart').html('').append('svg').attr('width', size+40).attr('height', size+40);
+  const g = svg.append('g').attr('transform', 'translate(30,10)');
+
+  const color = d3.scaleOrdinal([1,0]).range(['#58a6ff','#161b22']);
+  for (let q = 0; q < n; q++) {
+    for (let k = 0; k < n; k++) {
+      const val = k <= q ? 1 : 0;
+      g.append('rect').attr('x', k*cellSize).attr('y', q*cellSize).attr('width', cellSize-1).attr('height', cellSize-1)
+        .attr('fill', color(val)).attr('rx', 2);
+      g.append('text').attr('x', k*cellSize+cellSize/2).attr('y', q*cellSize+cellSize/2+4).attr('text-anchor','middle').attr('font-size','9px').attr('fill', val?'#0d1117':'#444').text(val);
+    }
+  }
+  g.append('text').attr('x', size/2).attr('y', size+16).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','11px').text('Key position →');
+  g.append('text').attr('x', -size/2).attr('y', -10).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','11px').attr('transform','rotate(-90)').text('Query position ↓');
+}
+drawCausalMask();
+
+/* ====== Softmax Attention after mask ====== */
+function drawSoftmaxAttn() {
+  const n = 8;
+  const size = 280, cellSize = size / n;
+  const svg = d3.select('#softmax-attn-chart').html('').append('svg').attr('width', size+80).attr('height', size+40);
+  const g = svg.append('g').attr('transform', 'translate(30,10)');
+
+  for (let q = 0; q < n; q++) {
+    const vals = [];
+    for (let k = 0; k <= q; k++) vals.push(0.5 + Math.random()*0.5);
+    const s = vals.reduce((a,b) => a+b, 0);
+    for (let k = 0; k < n; k++) {
+      const v = k <= q ? vals[k]/s : 0;
+      const color = d3.interpolateViridis(v);
+      g.append('rect').attr('x', k*cellSize).attr('y', q*cellSize).attr('width', cellSize-1).attr('height', cellSize-1)
+        .attr('fill', color).attr('rx', 2);
+      if (k <= q) g.append('text').attr('x', k*cellSize+cellSize/2).attr('y', q*cellSize+cellSize/2+3).attr('text-anchor','middle').attr('font-size','7px').attr('fill', v>0.5?'#fff':'#333').text(v.toFixed(2));
+    }
+  }
+  const legend = svg.append('g').attr('transform', `translate(${size+40}, 10)`);
+  for (let i = 0; i < 10; i++) {
+    const c = d3.interpolateViridis(i/9);
+    legend.append('rect').attr('x',0).attr('y', i*14).attr('width',12).attr('height',12).attr('fill',c);
+    legend.append('text').attr('x',16).attr('y', i*14+10).attr('fill','var(--fg2)').attr('font-size','9px').text((i/9).toFixed(1));
+  }
+}
+drawSoftmaxAttn();
+
+/* ====== Attention Heatmap ====== */
+function drawAttentionHeatmap() {
+  const seqLen = parseInt(document.getElementById('attn-seq-len').value);
+  const head = parseInt(document.getElementById('attn-head').value);
+  const temperature = parseInt(document.getElementById('attn-temp').value) / 10;
+  document.getElementById('attn-seq-len-val').textContent = seqLen;
+  document.getElementById('attn-head-val').textContent = head;
+  document.getElementById('attn-temp-val').textContent = temperature.toFixed(1);
+
+  const margin = {top: 40, right: 20, bottom: 30, left: 40};
+  const cellSize = Math.min(30, 300/seqLen);
+  const w = seqLen * cellSize + margin.left + margin.right;
+  const h = seqLen * cellSize + margin.top + margin.bottom;
+  const svg = d3.select('#attention-heatmap').html('').append('svg').attr('width', w).attr('height', h);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const rng = mulberry32(head * 1000 + 42);
+  const rawScores = [];
+  for (let q = 0; q < seqLen; q++) {
+    rawScores[q] = [];
+    for (let k = 0; k < seqLen; k++) {
+      rawScores[q][k] = (k <= q) ? rng() / temperature : -1e9;
+    }
+  }
+  const data = [];
+  for (let q = 0; q < seqLen; q++) {
+    const maxScore = Math.max(...rawScores[q].filter(v => v > -1e8));
+    const exps = rawScores[q].map(v => v > -1e8 ? Math.exp(v - maxScore) : 0);
+    const sumExps = exps.reduce((a,b) => a+b, 0);
+    const probs = exps.map(e => e / sumExps);
+    for (let k = 0; k < seqLen; k++) {
+      data.push({q, k, v: probs[k]});
+    }
+  }
+
+  const colorScale = d3.scaleSequential(d3.interpolateViridis).domain([0, 1]);
+
+  g.selectAll('rect').data(data).join('rect')
+    .attr('x', d => d.k * cellSize).attr('y', d => d.q * cellSize)
+    .attr('width', cellSize-0.5).attr('height', cellSize-0.5)
+    .attr('fill', d => colorScale(d.v)).attr('rx', 1)
+    .attr('class','heatmap-cell');
+
+  g.selectAll('.val-text').data(data.filter(d => cellSize >= 18)).join('text')
+    .attr('x', d => d.k*cellSize+cellSize/2).attr('y', d => d.q*cellSize+cellSize/2+3)
+    .attr('text-anchor','middle').attr('font-size','7px').attr('fill', d => d.v>0.6?'#fff':'#333')
+    .text(d => d.v.toFixed(2));
+
+  g.append('text').attr('x', seqLen*cellSize/2).attr('y', -15).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','11px')
+    .text(`Head ${head}, seq_len=${seqLen}, T=${temperature.toFixed(1)}`);
+  g.append('text').attr('x', seqLen*cellSize/2).attr('y', seqLen*cellSize+18).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','10px').text('Key position →');
+  g.append('text').attr('x', -seqLen*cellSize/2).attr('y', -5).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','10px').attr('transform','rotate(-90)').text('Query position ↓');
+}
+
+function mulberry32(a) { return function() { a |= 0; a = a + 0x6D2B79F5 | 0; var t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+/* Self vs Cross attention */
+function drawSelfCrossAttn() {
+  const n = 8;
+  const cellSize = 24;
+
+  function drawAttn(selector, isCross) {
+    const srcLen = isCross ? 10 : n;
+    const w = srcLen * cellSize + 40;
+    const h = n * cellSize + 20;
+    const svg = d3.select(selector).html('').append('svg').attr('width', w+10).attr('height', h+10);
+    const g = svg.append('g').attr('transform','translate(5,5)');
+    const rng = mulberry32(isCross ? 77 : 33);
+
+    for (let q = 0; q < n; q++) {
+      const vals = [];
+      for (let k = 0; k < srcLen; k++) {
+        if (isCross) vals.push(0.2 + rng()*0.8);
+        else vals.push(k <= q ? 0.3 + rng()*0.7 : 0);
+      }
+      const s = vals.reduce((a,b) => a+b, 0);
+      for (let k = 0; k < srcLen; k++) {
+        const v = vals[k]/s;
+        g.append('rect').attr('x', k*cellSize).attr('y', q*cellSize).attr('width',cellSize-0.5).attr('height',cellSize-0.5)
+          .attr('fill', d3.interpolateViridis(v)).attr('rx',1);
+      }
+    }
+    const label = isCross ? 'Key = Encoder (10 pos)' : '下三角：只能看过去';
+    g.append('text').attr('x', srcLen*cellSize/2).attr('y', n*cellSize+14).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','9px').text(label);
+  }
+  drawAttn('#self-attn-heatmap', false);
+  drawAttn('#cross-attn-heatmap', true);
+}
+
+document.getElementById('attn-seq-len').addEventListener('input', drawAttentionHeatmap);
+document.getElementById('attn-head').addEventListener('input', drawAttentionHeatmap);
+document.getElementById('attn-temp').addEventListener('input', drawAttentionHeatmap);
+drawAttentionHeatmap();
+drawSelfCrossAttn();
+
+/* ====== Pre-LN vs Post-LN gradient flow ====== */
+function drawPreNorm() {
+  const w = 700, h = 280;
+  const svg = d3.select('#prenorm-chart').html('').append('svg').attr('width', w).attr('height', h);
+
+  // Pre-LN side
+  const g1 = svg.append('g').attr('transform','translate(60,20)');
+  g1.append('text').attr('x', 120).attr('y', 0).attr('text-anchor','middle').attr('fill','var(--accent)').attr('font-weight','bold').text('Pre-LN');
+  const blocks1 = [{y:20, h:30, label:'x', color:'#1c3a5f'},
+    {y:60, h:30, label:'LN', color:'#3b1f5f'},
+    {y:100,h:30, label:'Attn', color:'#5f3b1f'},
+    {y:140,h:30, label:'+residual', color:'#1f5f3b'},
+    {y:180,h:30, label:'output', color:'#1f5f3b'}];
+  blocks1.forEach((b,i) => {
+    g1.append('rect').attr('x',20).attr('y',b.y).attr('width',200).attr('height',b.h).attr('fill',b.color).attr('rx',4).attr('stroke','var(--border)');
+    g1.append('text').attr('x',120).attr('y',b.y+b.h/2+4).attr('text-anchor','middle').attr('fill','#e6edf3').attr('font-size','12px').text(b.label);
+  });
+  // Residual shortcut arrow for Pre-LN
+  g1.append('path').attr('d','M230,35 C260,35 260,155 230,155').attr('fill','none').attr('stroke','var(--green)').attr('stroke-width',2).attr('stroke-dasharray','5,3');
+  g1.append('text').attr('x',265).attr('y',95).attr('fill','var(--green)').attr('font-size','10px').text('梯度捷径');
+
+  // Post-LN side
+  const g2 = svg.append('g').attr('transform','translate(400,20)');
+  g2.append('text').attr('x', 120).attr('y', 0).attr('text-anchor','middle').attr('fill','var(--orange)').attr('font-weight','bold').text('Post-LN');
+  const blocks2 = [{y:20, h:30, label:'x', color:'#1c3a5f'},
+    {y:60, h:30, label:'Attn', color:'#5f3b1f'},
+    {y:100,h:30, label:'+residual', color:'#1f5f3b'},
+    {y:140,h:30, label:'LN', color:'#3b1f5f'},
+    {y:180,h:30, label:'output', color:'#1f5f3b'}];
+  blocks2.forEach(b => {
+    g2.append('rect').attr('x',20).attr('y',b.y).attr('width',200).attr('height',b.h).attr('fill',b.color).attr('rx',4).attr('stroke','var(--border)');
+    g2.append('text').attr('x',120).attr('y',b.y+b.h/2+4).attr('text-anchor','middle').attr('fill','#e6edf3').attr('font-size','12px').text(b.label);
+  });
+  // Residual shortcut for Post-LN passes through LN
+  g2.append('path').attr('d','M230,35 C260,35 260,155 230,155').attr('fill','none').attr('stroke','var(--red)').attr('stroke-width',2).attr('stroke-dasharray','5,3');
+  g2.append('text').attr('x',265).attr('y',95).attr('fill','var(--red)').attr('font-size','10px').text('梯度穿过LN');
+}
+// drawPreNorm() called lazily on tab switch
+
+/* ====== Positional Encoding ====== */
+function drawPE() {
+  const dModel = parseInt(document.getElementById('pe-dim').value);
+  const seqLen = parseInt(document.getElementById('pe-len').value);
+  document.getElementById('pe-dim-val').textContent = dModel;
+  document.getElementById('pe-len-val').textContent = seqLen;
+
+  const margin = {top: 20, right: 20, bottom: 40, left: 50};
+  const width = 800 - margin.left - margin.right;
+  const height = 300 - margin.top - margin.bottom;
+
+  const svg = d3.select('#pe-chart').html('').append('svg')
+    .attr('width', width + margin.left + margin.right)
+    .attr('height', height + margin.top + margin.bottom)
+    .append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const x = d3.scaleLinear().domain([0, dModel-1]).range([0, width]);
+  const y = d3.scaleLinear().domain([-1.2, 1.2]).range([height, 0]);
+
+  svg.append('g').attr('class','axis').attr('transform',`translate(0,${height})`).call(d3.axisBottom(x).ticks(8).tickFormat(d => `d${d}`));
+  svg.append('g').attr('class','axis').call(d3.axisLeft(y));
+
+  const colors = d3.schemeCategory10;
+  const positions = [0, Math.floor(seqLen/4), Math.floor(seqLen/2), seqLen-4];
+  positions.forEach((pos, idx) => {
+    const data = Array.from({length: dModel}, (_, i) => {
+      const angle = pos / Math.pow(10000, 2*Math.floor(i/2) / dModel);
+      return i % 2 === 0 ? Math.sin(angle) : Math.cos(angle);
+    });
+    const line = d3.line().x((d,i) => x(i)).y(d => y(d)).curve(d3.curveBasis);
+    svg.append('path').datum(data).attr('d', line).attr('fill','none').attr('stroke', colors[idx]).attr('stroke-width', 1.5).attr('opacity', 0.8);
+  });
+
+  positions.forEach((pos, idx) => {
+    svg.append('circle').attr('cx', width+5).attr('cy', 15+idx*18).attr('r',4).attr('fill',colors[idx]);
+    svg.append('text').attr('x', width+12).attr('y', 19+idx*18).attr('fill','var(--fg2)').attr('font-size','11px').text(`pos=${pos}`);
+  });
+
+  svg.append('text').attr('x', width/2).attr('y', height+35).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','11px').text('Dimension index (even=sin, odd=cos)');
+}
+document.getElementById('pe-dim').addEventListener('input', drawPE);
+document.getElementById('pe-len').addEventListener('input', drawPE);
+drawPE();
+
+/* ====== Forward Pass Animation ====== */
+let animRunning = false;
+let animTimer = null;
+document.getElementById('fwd-play-btn').addEventListener('click', function() {
+  if (animRunning) { clearInterval(animTimer); animRunning = false; this.textContent = '\u25B6 播放前向传播'; return; }
+  animRunning = true; this.textContent = '\u2759\u2759 暂停';
+  const blocks = document.querySelectorAll('.anim-block');
+  blocks.forEach(b => b.classList.remove('active'));
+  let step = 0;
+  animTimer = setInterval(() => {
+    if (step > 0) blocks[step-1].classList.remove('active');
+    blocks[step].classList.add('active');
+    step++;
+    if (step >= blocks.length) { clearInterval(animTimer); animRunning = false; document.getElementById('fwd-play-btn').textContent = '\u25B6 播放前向传播'; }
+  }, 600);
+});
+
+/* ====== Loss Curve ====== */
+function drawLossCurve() {
+  const margin = {top: 20, right: 30, bottom: 40, left: 50};
+  const width = 760 - margin.left - margin.right;
+  const height = 280 - margin.top - margin.bottom;
+
+  const svg = d3.select('#loss-chart').html('').append('svg')
+    .attr('width', width + margin.left + margin.right)
+    .attr('height', height + margin.top + margin.bottom)
+    .append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const epochs = Array.from({length: 60}, (_, i) => i);
+  const trainLoss = epochs.map(e => 3.3 * Math.exp(-0.08*e) + 0.3 + Math.random()*0.05);
+  const valLoss = epochs.map(e => 3.3 * Math.exp(-0.07*e) + 0.35 + Math.random()*0.08);
+
+  const x = d3.scaleLinear().domain([0, 60]).range([0, width]);
+  const y = d3.scaleLinear().domain([0, 3.5]).range([height, 0]);
+
+  svg.append('g').attr('class','axis').attr('transform',`translate(0,${height})`).call(d3.axisBottom(x).ticks(10).tickFormat(d => `E${d}`));
+  svg.append('g').attr('class','axis').call(d3.axisLeft(y));
+
+  const trainLine = d3.line().x((_,i) => x(i)).y(d => y(d)).curve(d3.curveBasis);
+  const valLine = d3.line().x((_,i) => x(i)).y(d => y(d)).curve(d3.curveBasis);
+
+  svg.append('path').datum(trainLoss).attr('d', trainLine).attr('fill','none').attr('stroke','var(--accent)').attr('stroke-width',2);
+  svg.append('path').datum(valLoss).attr('d', valLine).attr('fill','none').attr('stroke','var(--orange)').attr('stroke-width',2).attr('stroke-dasharray','6,3');
+
+  svg.append('circle').attr('cx', width-100).attr('cy', 15).attr('r',4).attr('fill','var(--accent)');
+  svg.append('text').attr('x', width-90).attr('y', 19).attr('fill','var(--fg2)').attr('font-size','11px').text('Training Loss');
+  svg.append('line').attr('x1', width-108).attr('y1', 35).attr('x2', width-92).attr('y2', 35).attr('stroke','var(--orange)').attr('stroke-width',2).attr('stroke-dasharray','6,3');
+  svg.append('text').attr('x', width-90).attr('y', 39).attr('fill','var(--fg2)').attr('font-size','11px').text('Validation Loss');
+  svg.append('text').attr('x', width/2).attr('y', height+35).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','11px').text('Epoch');
+  svg.append('text').attr('x', -height/2).attr('y', -40).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','11px').attr('transform','rotate(-90)').text('Cross-Entropy Loss');
+}
+drawLossCurve();
+
+/* ====== Speedup Chart ====== */
+function drawSpeedup() {
+  const margin = {top: 20, right: 30, bottom: 40, left: 60};
+  const width = 700 - margin.left - margin.right;
+  const height = 280 - margin.top - margin.bottom;
+
+  const svg = d3.select('#speedup-chart').html('').append('svg')
+    .attr('width', width + margin.left + margin.right)
+    .attr('height', height + margin.top + margin.bottom)
+    .append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const data = [{len:50, nocache:118, cached:2}, {len:100, nocache:250, cached:2}, {len:200, nocache:520, cached:2}, {len:400, nocache:1077, cached:2}];
+
+  const x = d3.scaleBand().domain(data.map(d => d.len)).range([0, width]).padding(0.3);
+  const y = d3.scaleLinear().domain([0, 1200]).range([height, 0]);
+
+  svg.append('g').attr('class','axis').attr('transform',`translate(0,${height})`).call(d3.axisBottom(x).tickFormat(d => `${d} tokens`));
+  svg.append('g').attr('class','axis').call(d3.axisLeft(y).tickFormat(d => `${d}ms`));
+
+  const barW = x.bandwidth() / 2;
+  data.forEach(d => {
+    svg.append('rect').attr('x', x(d.len)).attr('y', y(d.nocache)).attr('width', barW).attr('height', height-y(d.nocache)).attr('fill','var(--red)').attr('rx',3);
+    svg.append('rect').attr('x', x(d.len)+barW).attr('y', y(d.cached)).attr('width', barW).attr('height', height-y(d.cached)).attr('fill','var(--green)').attr('rx',3);
+    svg.append('text').attr('x', x(d.len)+barW/2).attr('y', y(d.nocache)-5).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','10px').text(`${d.nocache}ms`);
+    svg.append('text').attr('x', x(d.len)+barW*1.5).attr('y', y(d.cached)-5).attr('text-anchor','middle').attr('fill','var(--fg2)').attr('font-size','10px').text(`${d.cached}ms`);
+  });
+
+  svg.append('rect').attr('x', width-140).attr('y', 10).attr('width',12).attr('height',12).attr('fill','var(--red)').attr('rx',2);
+  svg.append('text').attr('x', width-122).attr('y', 20).attr('fill','var(--fg2)').attr('font-size','11px').text('No Cache');
+  svg.append('rect').attr('x', width-140).attr('y', 28).attr('width',12).attr('height',12).attr('fill','var(--green)').attr('rx',2);
+  svg.append('text').attr('x', width-122).attr('y', 38).attr('fill','var(--fg2)').attr('font-size','11px').text('KV Cache');
+}
+// drawSpeedup() called lazily on tab switch
+
+/* ====== Tokenizer Demo ====== */
+function updateTokenizerDemo() {
+  const input = document.getElementById('tok-input').value;
+  const mode = document.getElementById('tok-mode').value;
+  const output = document.getElementById('tok-output');
+
+  const specials = ['&lt;pad&gt;','&lt;unk&gt;','&lt;bos&gt;','&lt;eos&gt;'];
+  let html = '';
+  if (mode === 'char') {
+    const charset = 'abcdefghijklmnopqrstuvwxyz .';
+    for (let i = 0; i < Math.min(input.length, 20); i++) {
+      const ch = input[i].toLowerCase();
+      const id = charset.indexOf(ch);
+      const valid = id >= 0;
+      html += `<span style="display:inline-block;margin:3px;padding:4px 8px;background:${valid?'var(--bg3)':'var(--bg2)'};border:1px solid ${valid?'var(--accent)':'var(--red)'};border-radius:4px;font-size:.85rem">`;
+      html += `<span style="color:var(--accent);font-weight:600">${ch}</span>`;
+      html += `<br><span style="font-size:.7rem;color:var(--fg2)">id=${valid?id+4:1}</span>`;
+      html += `</span>`;
+    }
+  } else if (mode === 'byte') {
+    for (let i = 0; i < Math.min(input.length, 12); i++) {
+      const byte = input.charCodeAt(i) & 0xFF;
+      html += `<span style="display:inline-block;margin:3px;padding:4px 8px;background:var(--bg3);border:1px solid var(--accent);border-radius:4px;font-size:.85rem">`;
+      html += `<span style="color:var(--accent);font-weight:600">0x${byte.toString(16).padStart(2,'0')}</span>`;
+      html += `<br><span style="font-size:.7rem;color:var(--fg2)">id=${byte+4}</span>`;
+      html += `</span>`;
+    }
+  } else if (mode === 'utf8') {
+    let pos = 0;
+    let idx = 4;
+    while (pos < input.length && idx < 30) {
+      const code = input.codePointAt(pos);
+      const ch = code > 0xFFFF ? input.substring(pos, pos+2) : input[pos];
+      html += `<span style="display:inline-block;margin:3px;padding:4px 8px;background:var(--bg3);border:1px solid var(--purple);border-radius:4px;font-size:.85rem">`;
+      html += `<span style="color:var(--purple);font-weight:600">${ch}</span>`;
+      html += `<br><span style="font-size:.7rem;color:var(--fg2)">U+${code.toString(16).padStart(4,'0')} → id=${idx}</span>`;
+      html += `</span>`;
+      pos += code > 0xFFFF ? 2 : 1;
+      idx++;
+    }
+  }
+  output.innerHTML = html;
+}
+document.getElementById('tok-input').addEventListener('input', updateTokenizerDemo);
+document.getElementById('tok-mode').addEventListener('change', updateTokenizerDemo);
+updateTokenizerDemo();
+
+/* ====== Scroll reveal ====== */
+const observer = new IntersectionObserver(entries => {
+  entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('visible'); } });
+}, {threshold: 0.1});
+document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+/* ====== KaTeX Rendering ====== */
+function renderKatex(id, tex) {
+  var el = document.getElementById(id);
+  if (el && typeof katex !== 'undefined') {
+    katex.render(tex, el, { displayMode: true, throwOnError: false });
+  }
+}
+renderKatex('f-tensor3d', '\\text{element}(b, s, d) = \\text{data}[b \\times \\text{seq\\_len} \\times d_{\\text{model}} + s \\times d_{\\text{model}} + d]');
+renderKatex('f-linear', 'y[\\ldots, \\text{out}] = \\sum_{\\text{in}} W[\\text{out}, \\text{in}] \\times x[\\ldots, \\text{in}]');
+renderKatex('f-softmax', '\\text{softmax}(x_i) = \\frac{\\exp(x_i - \\max)}{\\sum_j \\exp(x_j - \\max)}');
+renderKatex('f-layernorm', '\\hat{x}_i = \\frac{x_i - \\mu}{\\sqrt{\\sigma^2 + \\epsilon}} \\qquad y_i = \\gamma_i \\cdot \\hat{x}_i + \\beta_i');
+renderKatex('f-preln', 'y = x + \\text{SubLayer}(\\text{LN}(x))');
+renderKatex('f-postln', 'y = \\text{LN}(x + \\text{SubLayer}(x))');
+renderKatex('f-gradclip', '\\text{global\\_norm} = \\sqrt{\\sum_i \\|\\text{grad}_i\\|^2} \\qquad \\text{if } \\text{global\\_norm} > \\text{max\\_norm}: \\quad \\text{scale} = \\frac{\\text{max\\_norm}}{\\text{global\\_norm}} \\quad \\text{grad}_i \\mathrel{*}= \\text{scale}');
+}); // DOMContentLoaded
+</script>
+</body>
+</html>
